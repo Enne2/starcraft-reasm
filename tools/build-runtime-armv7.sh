@@ -43,7 +43,7 @@ cp "$ROOT"/runtime/shim-port/elf/*.c "$ROOT"/runtime/shim-port/elf/*.h "$SP/tool
 rm -f "$SP"/tools/elf/*_test.c
 
 shim_files=(win32_shim win32_ui gdi_elf com_ddraw com_dsound host_elf dlg_elf input_elf
-            win32_game smack_elf smack_audio snp_elf win32_shell_dlg)
+            win32_game smack_elf smack_audio snp_elf win32_shell_dlg sc_ctl)
 shim_present=()
 for f in "${shim_files[@]}"; do
   [[ -f "$SP/tools/elf/$f.c" ]] || { say "  shim assente nel check-out esterno: $f"; continue; }

@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <unistd.h>
 #include <stdlib.h>
+extern long atol(const char *);
 #include <time.h>
 #include <pthread.h>
 
@@ -335,6 +336,7 @@ static void arm_bridge_unk_stop(const char *name, uint32_t caller) {
  * limitato per non annegare il log (le prime N chiamate, poi un riepilogo). */
 static int g_trace = -1;
 static unsigned g_trace_n;
+static unsigned g_trace_max = 4000u;   /* SC_BRIDGE_TRACE_N: alzabile per finestre di traccia tardive */
 
 static void trace_args(_cpu *cpu, unsigned nargs) {
     static const char hx[] = "0123456789abcdef";
@@ -355,9 +357,14 @@ static void trace_import(const char *name, uint32_t caller) {
     static const char hx[] = "0123456789abcdef";
     char b[96];
     int i = 0, k;
-    if (g_trace < 0) g_trace = getenv("SC_BRIDGE_TRACE") ? 1 : 0;
+    if (g_trace < 0) {
+        const char *v = getenv("SC_BRIDGE_TRACE");
+        g_trace = v ? 1 : 0;
+        { const char *n = getenv("SC_BRIDGE_TRACE_N");
+          if (n && *n) { long l = atol(n); if (l > 0) g_trace_max = (unsigned) l; } }
+    }
     if (!g_trace) return;
-    if (++g_trace_n > 4000) return;
+    if (++g_trace_n > g_trace_max) return;
     for (k = 0; name[k] && i < 40; ++k) b[i++] = name[k];
     b[i++] = ' ';
     b[i++] = '@';

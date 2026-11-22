@@ -206,6 +206,10 @@ extern int close(int);
 extern int mkdirat(int, const char *, unsigned int);
 extern void *fdopendir(int);
 extern void *readdir64(void *);
+/* layout minimo di dirent64: sono le ABI glibc a definirlo, quindi l'offset di d_name non va
+ * cablato (su 32-bit ARM il campo non sta a 19 byte come su x86-64). */
+struct dirent64_layout { unsigned long long d_ino; unsigned long long d_off;
+                         unsigned short d_reclen; unsigned char d_type; char d_name[]; };
 extern int closedir(void *);
 extern int dirfd(void *);
 typedef struct { long long sec; game_u32 nsec; int reserved; } GameStatTime;
@@ -328,7 +332,10 @@ static int search_next(Search *s, GameFindData *data) {
         if (!entry) {
             int e = *__errno_location(); SetLastError(e ? file_error(e) : 18); return 0;
         }
-        name = (const char *)entry+19; /* Linux/glibc dirent64 d_name */
+        /* NIENTE offset cablato: su ARM/glibc il layout di `struct dirent64` va usato cosi' com'e'
+         * (l'offset 19 di `d_name` vale per dirent64 su x86-64; su altre ABI cambia e la lista
+         * file risultava vuota). */
+        name = ((const struct dirent64_layout *) entry)->d_name;
         if (!strcmp(name, ".") || !strcmp(name, "..") || !match_name(s->pattern, name)) continue;
         if (statx(dirfd(s->dir), name, 0, 0xFFF, &st)) {
             int e = *__errno_location();

@@ -33,6 +33,7 @@ for name in cpu_llasm game_memory_arm x86_helpers bridge_arm elf_support_arm x87
   "${CC[@]}" "${CFLAGS[@]}" -I "$RT" -I "$OUT" -c "$RT/$name.c" -o "$OUT/$name.o"
 done
 "${CC[@]}" "${CFLAGS[@]}" -I "$RT" -I "$OUT" -c "$RT/game_main_arm.c" -o "$OUT/game_main_arm.o"
+"${CC[@]}" "${CFLAGS[@]}" -std=c11 -I "$ROOT/runtime/shim-port/elf" -c "$ROOT/runtime/shim-port/elf/sc_ctl.c" -o "$OUT/sc_ctl.o"
 for src in "$X86/indirect_dispatch_x86.S" "$X86/com_bridge_x86.S" "$X86/guest_abs_zero_x86.S" "$OUT/bridge_stubs.S" "$OUT/guest_pe_bytes.S"; do
   objname="$(basename "${src%.S}")"
   [[ "$objname" == guest_pe_bytes ]] && objname=guest_pe_bytes_asm

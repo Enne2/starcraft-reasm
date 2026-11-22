@@ -15,6 +15,7 @@
 #include "host_elf.h"
 #include "reasm_elf.h"          /* log del runtime (toolkit) */
 #include "win32_shim.h"         /* timer Win32: consegna dei TIMERPROC dal pump */
+#include "sc_ctl.h"              /* API di automazione in-process */
 #include <sys/stat.h>              /* identita' del control-file e rilevamento rotazione */
 
 /* ---- libc dinamica (niente header: si resta freestanding) ---- */
@@ -336,6 +337,7 @@ static unsigned int g_presented_at;
 static unsigned int g_present_palette[256];
 static int g_present_snapshot_valid, g_present_force = 1;
 static int g_pal_set;                /* 0 = nessuna palette impostata (default: scala di grigi) */
+static int g_sc_ctl_initialized;
 static unsigned int g_map[256];      /* palette -> pixel nel formato della finestra */
 static int g_map_valid;
 static const void *g_map_fmt;
@@ -369,6 +371,7 @@ int host_elf_init(const char *title) {
     g_input_head=g_input_tail=g_input_lost=0; g_mods=g_polled_mods=0; g_polled_buttons=0;
     memset(g_keys,0,sizeof g_keys);
     g_test_stage=0;
+    if (!g_sc_ctl_initialized) { sc_ctl_start(); g_sc_ctl_initialized = 1; }
     g_w = g_h = g_pitch = 0; g_bpp = 8;
     g_want_fullscreen = g_is_fullscreen = 0;
     g_pal_set = 0; g_map_valid = 0; g_map_fmt = 0;
@@ -1119,12 +1122,15 @@ static void present_snapshot_commit(unsigned int now) {
     g_presented_at = now;
     g_pal_dirty = 0;
     g_present_force = 0;
+    sc_ctl_frame_presented(g_pal_set);
 }
 
 void host_elf_present(void) {
     SDL_Surface *ws;
     unsigned int now, cap;
     if (!g_win || !g_canvas) return;
+    /* Il server non legge mai il canvas: la richiesta viene copiata qui, nel thread proprietario. */
+    sc_ctl_present(g_canvas, g_w, g_h, g_pitch, g_pal);
     /* Input/pump resta sempre non-throttled anche quando si deduplica o si limita il present. */
     if (host_elf_input_owner() && win32_input_pump) win32_input_pump();
     now = SDL_GetTicks();
