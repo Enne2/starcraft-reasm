@@ -86,4 +86,15 @@ read -r -a EXTRA <<< "${LDFLAGS_EXTRA:-}"
     grep -oE "undefined symbol: [^ ]+" "$B/link-errors.txt" | sed 's/.*symbol: //' | sort -u >&2
     exit 1
   }
+if [[ "${SC_SPLIT_DEBUG:-0}" == 1 ]]; then
+  OBJCOPY="${OBJCOPY:-$(command -v llvm-objcopy || command -v objcopy || true)}"
+  [[ -n "$OBJCOPY" ]] || { echo 'llvm-objcopy/objcopy non trovato per SC_SPLIT_DEBUG=1' >&2; exit 2; }
+  DEBUG="$OUT.debug"
+  TMP="$OUT.split-debug.tmp"
+  "$OBJCOPY" --only-keep-debug "$OUT" "$DEBUG"
+  "$OBJCOPY" --strip-debug "$OUT" "$TMP"
+  "$OBJCOPY" --add-gnu-debuglink="$DEBUG" "$TMP"
+  mv "$TMP" "$OUT"
+  echo "debug separato: $DEBUG"
+fi
 echo "creato: $OUT"

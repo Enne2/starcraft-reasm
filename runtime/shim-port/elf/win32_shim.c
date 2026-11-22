@@ -593,8 +593,25 @@ typedef struct {
     u32 base, size, allocbase, allocprot, state, prot, type;
 } VmRegion;
 typedef struct { u32 base, size; int prot, shared; } VmMap;
-static VmRegion g_vm_regions[VM_REGION_CAP]; /* ordinata; i segmenti FREE adiacenti vengono coalesciati */
-static u32 g_vm_n, g_vm_base, g_vm_size, g_vm_used, g_vm_highwater, g_vm_calls;
+#define VM_REGION_CHUNK 256u
+static VmRegion *g_vm_regions; /* cresce a chunk sotto g_vm_mutex; gli indirizzi non escono dal lock */
+static u32 g_vm_region_cap, g_vm_n, g_vm_base, g_vm_size, g_vm_used, g_vm_highwater, g_vm_calls;
+static int vm_regions_reserve(u32 needed) {
+    u32 cap;
+    VmRegion *regions;
+    if (needed > VM_REGION_CAP) return 0;
+    if (needed <= g_vm_region_cap) return 1;
+    cap = (g_vm_region_cap + VM_REGION_CHUNK - 1u) & ~(VM_REGION_CHUNK - 1u);
+    if (!cap) cap = VM_REGION_CHUNK;
+    while (cap < needed) {
+        if (cap > VM_REGION_CAP - VM_REGION_CHUNK) { cap = VM_REGION_CAP; break; }
+        cap += VM_REGION_CHUNK;
+    }
+    regions = (VmRegion *)realloc(g_vm_regions, (ulong)cap * sizeof *regions);
+    if (!regions) return 0;
+    g_vm_regions = regions; g_vm_region_cap = cap;
+    return 1;
+}
 typedef struct { u32 base, size; } VmPoolEntry;
 static VmPoolEntry g_vm_pool[VM_POOL_CAP];
 static u32 g_vm_pool_n, g_vm_pool_bytes;
@@ -648,6 +665,7 @@ static int vm_init_locked(void) {
         if ((u32)(ulong)r != base || base >= VM_ARENA_MAX || size > VM_ARENA_MAX-base) {
             munmap(r,(ulong)size); continue; /* old kernels may ignore NOREPLACE: verify exact address */
         }
+        if (!vm_regions_reserve(1)) { munmap(r,(ulong)size); continue; }
         g_vm_base=base; g_vm_size=size; g_vm_n=1; g_vm_used=0; g_vm_highwater=base;
         g_vm_regions[0].base=base; g_vm_regions[0].size=size;
         g_vm_regions[0].allocbase=0; g_vm_regions[0].allocprot=0;
@@ -671,7 +689,7 @@ static int vm_split(u32 addr) {
     VmRegion right;
     if (k<0 || addr==g_vm_regions[k].base) return 1;
     end=g_vm_regions[k].base+g_vm_regions[k].size;
-    if (addr>=end || g_vm_n>=VM_REGION_CAP) return 0;
+    if (addr>=end || g_vm_n>=VM_REGION_CAP || !vm_regions_reserve(g_vm_n+1u)) return 0;
     right=g_vm_regions[k]; right.base=addr; right.size=end-addr;
     g_vm_regions[k].size=addr-g_vm_regions[k].base;
     for (i=g_vm_n; i>(u32)k+1; --i) g_vm_regions[i]=g_vm_regions[i-1];
@@ -1210,45 +1228,114 @@ extern int pthread_cond_broadcast(ui_cond_t *);
 extern int clock_gettime(int, void *);
 
 typedef struct { void *cs; int used; unsigned long owner; int count; ui_mutex_t m; } UiCs;
-static UiCs g_cs[256];
-static int g_cs_n;
-static int g_cs_lock;
+#define CS_CAP 256u
+#define CS_HASH_CAP 512u
+#define CS_TOMBSTONE ((UiCs *)(ulong)1)
+static UiCs g_cs[CS_CAP];
+static UiCs *g_cs_hash[CS_HASH_CAP];
 
-static void cs_lock(void) { while (__sync_lock_test_and_set(&g_cs_lock, 1)) { } }
-static void cs_unlock(void) { __sync_lock_test_and_set(&g_cs_lock, 0); }
+static u32 cs_hash(void *cs) {
+    ulong x = (ulong) cs;
+    x ^= x >> 17; x *= (ulong) 0xed5ad4bbu;
+    x ^= x >> 11; x *= (ulong) 0xac4c1b51u;
+    x ^= x >> 15;
+    return (u32)x & (CS_HASH_CAP - 1u);
+}
+
+/* La ricerca comune legge solo gli slot atomici: nessun lock globale né scan del pool. */
+static UiCs *cs_find(void *cs) {
+    u32 i, n = cs_hash(cs);
+    for (i = 0; i < CS_HASH_CAP; ++i) {
+        UiCs *e = __atomic_load_n(&g_cs_hash[(n + i) & (CS_HASH_CAP - 1u)], __ATOMIC_RELAXED);
+        if (!e) return 0;
+        if (e != CS_TOMBSTONE && __atomic_load_n(&e->cs, __ATOMIC_RELAXED) == cs) return e;
+    }
+    return 0;
+}
 
 static UiCs *cs_of(void *cs, int create) {
-    UiCs *e = 0;
-    int i;
-    cs_lock();
-    for (i = 0; i < g_cs_n; ++i) if (g_cs[i].used && g_cs[i].cs == cs) { e = &g_cs[i]; break; }
-    if (!e && create && g_cs_n < 256) {
-        e = &g_cs[g_cs_n++];
-        e->cs = cs; e->used = 1; e->owner = 0; e->count = 0;
-        { int k; for (k = 0; k < (int) sizeof e->m; ++k) ((char *) &e->m)[k] = 0; }  /* INITIALIZER */
+    UiCs *e;
+    u32 i, n;
+    if ((e = cs_find(cs)) != 0 || !create) return e;
+    for (;;) {
+        int k;
+        for (k = 0; k < (int)CS_CAP; ++k) {
+            int expected = 0;
+            if (__atomic_compare_exchange_n(&g_cs[k].used, &expected, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+                e = &g_cs[k];
+                __atomic_store_n(&e->cs, cs, __ATOMIC_RELAXED);
+                __atomic_store_n(&e->owner, 0ul, __ATOMIC_RELAXED);
+                __atomic_store_n(&e->count, 0, __ATOMIC_RELAXED);
+                n = cs_hash(cs);
+                for (i = 0; i < CS_HASH_CAP; ++i) {
+                    UiCs **slot = &g_cs_hash[(n + i) & (CS_HASH_CAP - 1u)];
+                    UiCs *value = __atomic_load_n(slot, __ATOMIC_RELAXED);
+                    if (value && value != CS_TOMBSTONE && __atomic_load_n(&value->cs, __ATOMIC_RELAXED) == cs) {
+                        __atomic_store_n(&e->cs, (void *)0, __ATOMIC_RELAXED);
+                        __atomic_store_n(&e->used, 0, __ATOMIC_RELEASE);
+                        return value;
+                    }
+                    if (!value || value == CS_TOMBSTONE) {
+                        UiCs *expected_slot = value;
+                        if (__atomic_compare_exchange_n(slot, &expected_slot, e, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return e;
+                        if (expected_slot && expected_slot != CS_TOMBSTONE &&
+                            __atomic_load_n(&expected_slot->cs, __ATOMIC_RELAXED) == cs) {
+                            __atomic_store_n(&e->cs, (void *)0, __ATOMIC_RELAXED);
+                            __atomic_store_n(&e->used, 0, __ATOMIC_RELEASE);
+                            return expected_slot;
+                        }
+                    }
+                }
+                __atomic_store_n(&e->cs, (void *)0, __ATOMIC_RELAXED);
+                __atomic_store_n(&e->used, 0, __ATOMIC_RELEASE);
+                return 0;
+            }
+        }
+        return 0; /* pool pieno: stessa semantica precedente */
     }
-    cs_unlock();
-    return e;
 }
 
 S void InitializeCriticalSection(void *cs) { (void) cs_of(cs, 1); }
 S int  InitializeCriticalSectionAndSpinCount(void *cs, u32 spin) { (void) spin; return cs_of(cs, 1) != 0; }
-S void DeleteCriticalSection(void *cs) { UiCs *e = cs_of(cs, 0); if (e) e->used = 0; }
+S void DeleteCriticalSection(void *cs) {
+    UiCs *e = cs_find(cs);
+    if (e) {
+        u32 n = cs_hash(cs), i;
+        for (i = 0; i < CS_HASH_CAP; ++i) {
+            UiCs **slot = &g_cs_hash[(n + i) & (CS_HASH_CAP - 1u)];
+            UiCs *value = __atomic_load_n(slot, __ATOMIC_RELAXED);
+            if (!value) break;
+            if (value == e) {
+                UiCs *expected = e;
+                if (__atomic_compare_exchange_n(slot, &expected, CS_TOMBSTONE, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+                    __atomic_store_n(&e->cs, (void *)0, __ATOMIC_RELAXED);
+                    __atomic_store_n(&e->used, 0, __ATOMIC_RELEASE);
+                }
+                break;
+            }
+        }
+    }
+}
 S void EnterCriticalSection(void *cs) {
     UiCs *e = cs_of(cs, 1);
     unsigned long me = pthread_self();
     if (!e) return;
-    if (e->owner == me) { ++e->count; return; }      /* ricorsione: come Windows */
+    if (__atomic_load_n(&e->owner, __ATOMIC_RELAXED) == me) {
+        __atomic_add_fetch(&e->count, 1, __ATOMIC_RELAXED); return;
+    }
     pthread_mutex_lock(&e->m);
-    e->owner = me;
-    e->count = 1;
+    __atomic_store_n(&e->owner, me, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->count, 1, __ATOMIC_RELAXED);
 }
 S void LeaveCriticalSection(void *cs) {
     UiCs *e = cs_of(cs, 0);
     if (!e) return;
-    if (e->owner == pthread_self() && e->count > 1) { --e->count; return; }
-    e->count = 0;
-    e->owner = 0;
+    if (__atomic_load_n(&e->owner, __ATOMIC_RELAXED) == pthread_self() &&
+        __atomic_load_n(&e->count, __ATOMIC_RELAXED) > 1) {
+        __atomic_sub_fetch(&e->count, 1, __ATOMIC_RELAXED); return;
+    }
+    __atomic_store_n(&e->count, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->owner, 0ul, __ATOMIC_RELAXED);
     pthread_mutex_unlock(&e->m);
 }
 

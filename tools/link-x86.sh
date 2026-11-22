@@ -38,4 +38,15 @@ clang --target=i686-unknown-linux-gnu -m32 -fno-pie -no-pie --ld-path="$LLD" \
   "$ENTRY/StarCraft.entry.o" "$ENTRY/storm.entry.o" \
   "${runtime_objs[@]}" "${shim_objs[@]}" \
   -lSDL2 -ldl -lpthread -lm -lgcc_s -lc
+if [[ "${SC_SPLIT_DEBUG:-0}" == 1 ]]; then
+  OBJCOPY="${OBJCOPY:-$(command -v llvm-objcopy || command -v objcopy || true)}"
+  [[ -n "$OBJCOPY" ]] || { echo 'llvm-objcopy/objcopy non trovato per SC_SPLIT_DEBUG=1' >&2; exit 2; }
+  DEBUG="$OUT.debug"
+  TMP="$OUT.split-debug.tmp"
+  "$OBJCOPY" --only-keep-debug "$OUT" "$DEBUG"
+  "$OBJCOPY" --strip-debug "$OUT" "$TMP"
+  "$OBJCOPY" --add-gnu-debuglink="$DEBUG" "$TMP"
+  mv "$TMP" "$OUT"
+  printf 'debug separato: %s\n' "$DEBUG"
+fi
 printf 'creato: %s\n' "$OUT"

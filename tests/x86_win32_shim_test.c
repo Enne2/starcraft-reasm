@@ -13,6 +13,11 @@
 #define S __attribute__((stdcall))
 typedef uint32_t u32;
 extern u32 S GetCurrentThreadId(void);
+extern void S InitializeCriticalSection(void *);
+extern int S InitializeCriticalSectionAndSpinCount(void *, u32);
+extern void S EnterCriticalSection(void *);
+extern void S LeaveCriticalSection(void *);
+extern void S DeleteCriticalSection(void *);
 extern u32 S FindWindowA(const char *, const char *);
 extern u32 S FindWindowExA(u32, u32, const char *, const char *);
 extern u32 S GetLastActivePopup(u32);
@@ -75,6 +80,17 @@ void reasm_elf_log_hex(unsigned long n) {
 int win32_snp_vfile_own(void *h) { return h == (void *)(uintptr_t)0x534E5001u; }
 static u32 worker_tid;
 static void *thread_fn(void *p) { (void)p; worker_tid=GetCurrentThreadId(); return 0; }
+static unsigned char test_cs[64];
+static volatile unsigned long cs_counter;
+static void *cs_worker(void *p) {
+    unsigned i; (void)p;
+    for (i=0; i<100000; ++i) {
+        EnterCriticalSection(test_cs); EnterCriticalSection(test_cs);
+        ++cs_counter;
+        LeaveCriticalSection(test_cs); LeaveCriticalSection(test_cs);
+    }
+    return 0;
+}
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); return 1; } } while(0)
 int main(void) {
     pthread_t t; u32 main_tid=GetCurrentThreadId();
@@ -129,5 +145,28 @@ int main(void) {
       close(fds[1]); { size_t used=0; while (used<sizeof(out)-1 && (n=read(fds[0],out+used,sizeof(out)-1-used))>0) used+=(size_t)n; out[used]=0; } close(fds[0]); CHECK(out[0]!=0);
       CHECK(waitpid(p,&st,0)==p && WIFEXITED(st) && WEXITSTATUS(st)==70);
       CHECK(strstr(out,"fs:[0]=0x00001000") && strstr(out,"handler=0x00401234") && strstr(out,"<end>")); }
+    {
+      pthread_t workers[4]; int i;
+      memset(test_cs,0,sizeof test_cs); cs_counter=0;
+      CHECK(InitializeCriticalSectionAndSpinCount(test_cs,4000)==1);
+      EnterCriticalSection(test_cs); EnterCriticalSection(test_cs);
+      LeaveCriticalSection(test_cs); LeaveCriticalSection(test_cs);
+      for(i=0;i<4;i++) CHECK(pthread_create(&workers[i],0,cs_worker,0)==0);
+      for(i=0;i<4;i++) CHECK(pthread_join(workers[i],0)==0);
+      CHECK(cs_counter==400000ul);
+      DeleteCriticalSection(test_cs);
+      CHECK(InitializeCriticalSectionAndSpinCount(test_cs,0)==1);
+      EnterCriticalSection(test_cs); LeaveCriticalSection(test_cs);
+      DeleteCriticalSection(test_cs);
+      {
+        static unsigned char capacity_cs[256][64], overflow_cs[64];
+        for(i=0;i<256;i++) CHECK(InitializeCriticalSectionAndSpinCount(capacity_cs[i],0)==1);
+        CHECK(InitializeCriticalSectionAndSpinCount(overflow_cs,0)==0);
+        DeleteCriticalSection(capacity_cs[127]);
+        CHECK(InitializeCriticalSectionAndSpinCount(overflow_cs,0)==1);
+        for(i=0;i<256;i++) DeleteCriticalSection(capacity_cs[i]);
+        DeleteCriticalSection(overflow_cs);
+      }
+    }
     puts("x86_win32_shim_test: PASS"); return 0;
 }

@@ -29,6 +29,7 @@ extern void free(void *);
 extern char *getenv(const char *);
 extern int fcntl(int, int, ...);
 extern int setsockopt(int, int, int, const void *, unsigned int);
+extern int clock_gettime(int, void *);
 
 #define SNP_MODULE 0x72000001u /* standalone gate only; runtime uses the PE resource handle */
 #define SNP_AF_INET 2
@@ -111,6 +112,10 @@ static const struct SnpProfile {
 static struct SnpCaps g_caps = { 0x24, SNP_CAPS_FLAGS, 500, 16, 8, 1000, 50, 8, 2 };
 static int g_socket_fd = -1;
 static u32 g_module_handle;
+static u32 g_net_poll_ms = 1;
+static int g_poll_socket_fd = -1;
+static int g_last_poll_valid;
+static long long g_last_poll_ns;
 extern unsigned int win32_ui_load_library(const char *) __attribute__((weak));
 extern void *arm_bridge_lookup_thunk(const char *) __attribute__((weak));
 
@@ -140,6 +145,18 @@ static u32 parse_port(const char *s) {
     return *s ? 0 : n;
 }
 
+static u32 net_poll_interval_ms(void) {
+    const char *s = getenv("SC_NET_POLL_MS");
+    u32 n = 0;
+    if (!s || !*s) return 1;
+    while (*s >= '0' && *s <= '9') {
+        u32 digit = (u32)(*s++ - '0');
+        if (n > (0xffffffffu - digit) / 10u) return 1;
+        n = n * 10u + digit;
+    }
+    return *s ? 1 : n;
+}
+
 static int open_loopback_socket(void) {
     struct SnpSockaddrIn local;
     const char *bind_ip = getenv("SC_LAN_BIND"), *port_env = getenv("SC_LAN_PORT");
@@ -155,6 +172,9 @@ static int open_loopback_socket(void) {
     (void)setsockopt(fd, SNP_SOL_SOCKET, SNP_SO_BROADCAST, &one, sizeof one);
     if (bind(fd, &local, sizeof local) != 0) { close(fd); return -1; }
     { int flags = fcntl(fd, SNP_F_GETFL, 0); if (flags < 0 || fcntl(fd, SNP_F_SETFL, flags | SNP_O_NONBLOCK) < 0) { close(fd); return -1; } }
+    g_net_poll_ms = net_poll_interval_ms();
+    g_poll_socket_fd = fd;
+    g_last_poll_valid = 0;
     return fd;
 }
 
@@ -293,16 +313,38 @@ static int receive_packet(struct SnpNetAddress **address, char **data, u32 *byte
     struct SnpSockaddrIn from;
     unsigned int from_bytes = sizeof from;
     struct SnpPacket *packet;
+    char payload[SNP_MAX_DATAGRAM];
     int n;
     u32 i;
+    long long poll_time_ns = 0;
+    int have_poll_time = 0;
     if (address) *address = 0; if (data) *data = 0; if (bytes) *bytes = 0;
     if (!address || !data || !bytes || g_socket_fd < 0) return 0;
-    packet = (struct SnpPacket *)malloc(sizeof(*packet) + SNP_MAX_DATAGRAM);
+    if (g_net_poll_ms && g_poll_socket_fd == g_socket_fd) {
+        struct { long sec, nsec; } ts;
+        if (clock_gettime(1 /* CLOCK_MONOTONIC */, &ts) == 0) {
+            poll_time_ns = (long long)ts.sec * 1000000000LL + ts.nsec;
+            have_poll_time = 1;
+            if (g_last_poll_valid) {
+                long long elapsed = poll_time_ns - g_last_poll_ns;
+                if (elapsed >= 0 && elapsed < (long long)g_net_poll_ms * 1000000LL) return 0;
+            }
+        }
+    }
+    /* Receive first into storage large enough for every valid IPv4 UDP datagram. Empty polls and
+     * socket errors therefore do not churn the heap; allocate provider-owned memory only after a
+     * complete datagram has actually arrived. */
+    if (have_poll_time) {
+        g_last_poll_ns = poll_time_ns;
+        g_last_poll_valid = 1;
+    }
+    n = recvfrom(g_socket_fd, payload, sizeof payload, SNP_MSG_DONTWAIT, &from, &from_bytes);
+    if (n <= 0 || (unsigned int)n > sizeof payload || from_bytes != sizeof from) return 0;
+    packet = (struct SnpPacket *)malloc(sizeof(*packet) + (unsigned int)n);
     if (!packet) return 0;
-    n = recvfrom(g_socket_fd, packet->data, SNP_MAX_DATAGRAM, SNP_MSG_DONTWAIT, &from, &from_bytes);
-    if (n <= 0 || from_bytes != sizeof from) { free(packet); return 0; }
     for (i = 0; i < 16; ++i) packet->address.bytes[i] = ((const unsigned char *)&from)[i];
     packet->bytes = (u32)n;
+    for (i = 0; i < (u32)n; ++i) packet->data[i] = payload[i];
     *address = &packet->address; *data = packet->data; *bytes = (u32)n;
     return 1;
 }

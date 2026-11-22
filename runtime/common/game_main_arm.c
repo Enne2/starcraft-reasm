@@ -93,7 +93,7 @@ static void out_dec(unsigned v) {
 #define SC_PROF_LIMIT 1000u
 #define SC_PROF_TOP 20u
 typedef struct { volatile uint32_t pc, lr, sp, fp, hits; } ScProfSlot;
-static ScProfSlot g_sc_prof[SC_PROF_SLOTS];
+static ScProfSlot *g_sc_prof;
 static volatile uint32_t g_sc_prof_samples;
 static volatile sig_atomic_t g_sc_prof_done, g_sc_prof_exit;
 #include <pthread.h>
@@ -179,6 +179,8 @@ static void sc_prof_start(void) {
     const char *mode=getenv("SC_PROF"), *ex=getenv("SC_PROF_EXIT");
     struct sigaction sa; struct itimerval it; int sig;
     if(!mode || !mode[0]) return;
+    g_sc_prof=(ScProfSlot *)calloc(SC_PROF_SLOTS,sizeof *g_sc_prof);
+    if(!g_sc_prof) return;
     sig=(mode[0]=='w' && mode[1]=='a' && mode[2]=='l' && mode[3]=='l' && !mode[4])?SIGALRM:SIGPROF;
     g_sc_prof_exit=ex && ex[0]=='1' && !ex[1];
     memset(&sa,0,sizeof sa); sa.sa_sigaction=sc_prof_handler; sa.sa_flags=SA_SIGINFO; sigemptyset(&sa.sa_mask);

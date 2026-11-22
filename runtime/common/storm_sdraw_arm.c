@@ -260,31 +260,40 @@ static void reg8_set(uint32_t *eax,uint32_t *ecx,uint32_t *edx,uint32_t *ebx,uns
 static uint32_t rd32(uint32_t p) { uint32_t v; memcpy(&v,(const void *)(unsigned long)p,4); return v; }
 static void wr16(uint32_t p,uint16_t v) { memcpy((void *)(unsigned long)p,&v,2); }
 static void wr32(uint32_t p,uint32_t v) { memcpy((void *)(unsigned long)p,&v,4); }
-/* Validate SCode data operands at use: a direct-copy kernel need not provide a LUT, while an
- * actual table read with a null/unmapped base must still fail closed. */
-static uint8_t scode_rd8(uint32_t p) {
-    if (!proc_range(p,1,0)) fail73("SCode byte read range",0,p);
+/* A per-invocation, prevalidated contiguous span makes the common operand check
+ * lock-free. An operand outside the span keeps the original proc_range fallback. */
+typedef struct { uint32_t lo, hi; int valid; } ScSpan;
+static int span_contains(const ScSpan *s,uint32_t p,uint32_t n) {
+    uint64_t end=(uint64_t)p+n;
+    return s && s->valid && p>=s->lo && end<=s->hi;
+}
+static int spans_overlap(const ScSpan *a,const ScSpan *b) {
+    return a && b && a->valid && b->valid && a->lo<b->hi && b->lo<a->hi;
+}
+static uint8_t scode_rd8(uint32_t p,const ScSpan *s) {
+    if (!span_contains(s,p,1) && !proc_range(p,1,0)) fail73("SCode byte read range",0,p);
     return rd8(p);
 }
-static uint32_t scode_rd32(uint32_t p) {
+static uint32_t scode_rd32(uint32_t p,const ScSpan *s) {
     uint32_t v;
-    if (!proc_range(p,4,0)) fail73("SCode dword read range",0,p);
+    if (!span_contains(s,p,4) && !proc_range(p,4,0)) fail73("SCode dword read range",0,p);
     memcpy(&v,(const void *)(unsigned long)p,4); return v;
 }
-static void scode_wr8(uint32_t p,uint8_t v) {
-    if (!proc_range(p,1,1)) fail73("SCode byte write range",0,p);
+static void scode_wr8(uint32_t p,uint8_t v,const ScSpan *s) {
+    if (!span_contains(s,p,1) && !proc_range(p,1,1)) fail73("SCode byte write range",0,p);
     *(volatile uint8_t *)(unsigned long)p=v;
 }
-static void scode_wr16(uint32_t p,uint16_t v) {
-    if (!proc_range(p,2,1)) fail73("SCode word write range",0,p);
+static void scode_wr16(uint32_t p,uint16_t v,const ScSpan *s) {
+    if (!span_contains(s,p,2) && !proc_range(p,2,1)) fail73("SCode word write range",0,p);
     wr16(p,v);
 }
-static void scode_wr32(uint32_t p,uint32_t v) {
-    if (!proc_range(p,4,1)) fail73("SCode dword write range",0,p);
+static void scode_wr32(uint32_t p,uint32_t v,const ScSpan *s) {
+    if (!span_contains(s,p,4) && !proc_range(p,4,1)) fail73("SCode dword write range",0,p);
     wr32(p,v);
 }
 static void run_scode(_cpu *cpu,uint32_t entry,uint32_t code1,uint32_t size1,uint32_t code2,uint32_t size2,
-                      uint32_t code3,uint32_t size3,uint32_t a2,uint32_t dst_stride,uint32_t src_stride) {
+                      uint32_t code3,uint32_t size3,uint32_t a2,uint32_t dst_stride,uint32_t src_stride,
+                      const ScSpan *src_span,const ScSpan *dst_span,const ScSpan *base_span) {
     uint32_t eax=0,ebx=entry,ecx=rd32(a2+12),edx=cpu->_edx;
     uint32_t esi=rd32(a2+28),edi=rd32(a2+24),ebp=rd32(a2+32),pc=entry;
     uint32_t rows=ecx, steps=0;
@@ -303,45 +312,45 @@ static void run_scode(_cpu *cpu,uint32_t entry,uint32_t code1,uint32_t size1,uin
             if (op==0xC7 && rd8(pc+1)==0xC0) { eax=rd32(pc+2); pc+=6; }
             else if (op==0x8A && rd8(pc+1)==0xC4) { eax=(eax&0xFFFFFF00u)|((eax>>8)&0xFFu); pc+=2; }
             else if (op==0x8A && rd8(pc+1)==0xE0) { reg8_set(&eax,&ecx,&edx,&ebx,4,reg8_get(eax,ecx,edx,ebx,0)); pc+=2; }
-            else if (op==0x8A && rd8(pc+1)==0x26) { eax=(eax&0xFFFF00FFu)|((uint32_t)scode_rd8(esi)<<8); pc+=2; }
-            else if (op==0x8A && rd8(pc+1)==0x06) { eax=(eax&0xFFFFFF00u)|scode_rd8(esi); pc+=2; }
+            else if (op==0x8A && rd8(pc+1)==0x26) { eax=(eax&0xFFFF00FFu)|((uint32_t)scode_rd8(esi,src_span)<<8); pc+=2; }
+            else if (op==0x8A && rd8(pc+1)==0x06) { eax=(eax&0xFFFFFF00u)|scode_rd8(esi,src_span); pc+=2; }
             else if (op==0xFF && rd8(pc+1)==0xC6) { ++esi; pc+=2; }
-            else if (op==0x8A && rd8(pc+1)==0x04 && rd8(pc+2)==0x28) { eax=(eax&0xFFFFFF00u)|scode_rd8(eax+ebp); pc+=3; }
-            else if (op==0x66 && rd8(pc+1)==0x89 && rd8(pc+2)==0x07) { scode_wr16(edi,(uint16_t)eax); pc+=3; }
+            else if (op==0x8A && rd8(pc+1)==0x04 && rd8(pc+2)==0x28) { eax=(eax&0xFFFFFF00u)|scode_rd8(eax+ebp,base_span); pc+=3; }
+            else if (op==0x66 && rd8(pc+1)==0x89 && rd8(pc+2)==0x07) { scode_wr16(edi,(uint16_t)eax,dst_span); pc+=3; }
             else if (op==0x81 && rd8(pc+1)==0xC7) { edi+=rd32(pc+2); pc+=6; }
-            else if (op==0x89 && rd8(pc+1)==0x0F) { scode_wr32(edi,ecx); pc+=2; }
-            else if (op==0x8B && rd8(pc+1)==0x0F) { ecx=scode_rd32(edi); pc+=2; }
-            else if (op==0x8B && rd8(pc+1)==0x16) { edx=scode_rd32(esi); pc+=2; }
+            else if (op==0x89 && rd8(pc+1)==0x0F) { scode_wr32(edi,ecx,dst_span); pc+=2; }
+            else if (op==0x8B && rd8(pc+1)==0x0F) { ecx=scode_rd32(edi,dst_span); pc+=2; }
+            else if (op==0x8B && rd8(pc+1)==0x16) { edx=scode_rd32(esi,src_span); pc+=2; }
             /* Speculari a 8B 0F / 8B 16: caricamento a 32 bit dai due puntatori (8B /r, mod=00).
              * Misurati il 21/11/2026 sul kernel LUT a 4 byte per passo generato da Storm a
              * 0x20176A5A (StarCraft x86, dopo la conferma del profilo): il blocco apre con
              * 8B 0E 8B 17 8A C1 8A E2 81 C6 04000000 ... e chiude con 89 1F 81 C7 04000000. */
-            else if (op==0x8B && rd8(pc+1)==0x0E) { ecx=scode_rd32(esi); pc+=2; }
-            else if (op==0x8B && rd8(pc+1)==0x17) { edx=scode_rd32(edi); pc+=2; }
-            else if (op==0x8A && rd8(pc+1)==0x0F) { reg8_set(&eax,&ecx,&edx,&ebx,1,scode_rd8(edi)); pc+=2; }
-            else if (op==0x8A && rd8(pc+1)==0x16) { reg8_set(&eax,&ecx,&edx,&ebx,2,scode_rd8(esi)); pc+=2; }
+            else if (op==0x8B && rd8(pc+1)==0x0E) { ecx=scode_rd32(esi,src_span); pc+=2; }
+            else if (op==0x8B && rd8(pc+1)==0x17) { edx=scode_rd32(edi,dst_span); pc+=2; }
+            else if (op==0x8A && rd8(pc+1)==0x0F) { reg8_set(&eax,&ecx,&edx,&ebx,1,scode_rd8(edi,dst_span)); pc+=2; }
+            else if (op==0x8A && rd8(pc+1)==0x16) { reg8_set(&eax,&ecx,&edx,&ebx,2,scode_rd8(esi,src_span)); pc+=2; }
             /* Variante speculare dello stesso kernel LUT generato da Storm: legge il byte
              * sorgente in CL e quello di destinazione in DL (x86: 8A /r, mod=00). Misurata il
              * 21/11/2026 su StarCraft x86: SCode a 0x2016011A generato per il blit 320x320
              * (size1=0x4A, tre blocchi da 23 byte) iniziato con 8A 0E 8A 17 8A C1 8A E2
              * FF C6 8A 04 28 88 07 FF C7 C7 C0 00000000: senza 8A 0E / 8A 17 l'interprete
              * usciva fail-closed su un kernel perfettamente legale. */
-            else if (op==0x8A && rd8(pc+1)==0x0E) { reg8_set(&eax,&ecx,&edx,&ebx,1,scode_rd8(esi)); pc+=2; }
-            else if (op==0x8A && rd8(pc+1)==0x17) { reg8_set(&eax,&ecx,&edx,&ebx,2,scode_rd8(edi)); pc+=2; }
-            else if (op==0x88 && rd8(pc+1)==0x07) { scode_wr8(edi,reg8_get(eax,ecx,edx,ebx,0)); pc+=2; }
+            else if (op==0x8A && rd8(pc+1)==0x0E) { reg8_set(&eax,&ecx,&edx,&ebx,1,scode_rd8(esi,src_span)); pc+=2; }
+            else if (op==0x8A && rd8(pc+1)==0x17) { reg8_set(&eax,&ecx,&edx,&ebx,2,scode_rd8(edi,dst_span)); pc+=2; }
+            else if (op==0x88 && rd8(pc+1)==0x07) { scode_wr8(edi,reg8_get(eax,ecx,edx,ebx,0),dst_span); pc+=2; }
             else if (op==0xFF && rd8(pc+1)==0xC7) { ++edi; pc+=2; }
             else if (op==0x8A && rd8(pc+1)==0xC1) { reg8_set(&eax,&ecx,&edx,&ebx,0,reg8_get(eax,ecx,edx,ebx,1)); pc+=2; }
             else if (op==0x8A && rd8(pc+1)==0xE2) { reg8_set(&eax,&ecx,&edx,&ebx,4,reg8_get(eax,ecx,edx,ebx,2)); pc+=2; }
             else if (op==0x81 && rd8(pc+1)==0xC6) { esi+=rd32(pc+2); pc+=6; }
-            else if (op==0x8A && rd8(pc+1)==0x1C && rd8(pc+2)==0x28) { reg8_set(&eax,&ecx,&edx,&ebx,3,scode_rd8(eax+ebp)); pc+=3; }
+            else if (op==0x8A && rd8(pc+1)==0x1C && rd8(pc+2)==0x28) { reg8_set(&eax,&ecx,&edx,&ebx,3,scode_rd8(eax+ebp,base_span)); pc+=3; }
             else if (op==0x8A && rd8(pc+1)==0xC5) { reg8_set(&eax,&ecx,&edx,&ebx,0,reg8_get(eax,ecx,edx,ebx,5)); pc+=2; }
             else if (op==0x8A && rd8(pc+1)==0xE6) { reg8_set(&eax,&ecx,&edx,&ebx,4,reg8_get(eax,ecx,edx,ebx,6)); pc+=2; }
             else if (op==0xC1 && (rd8(pc+1)==0xC9 || rd8(pc+1)==0xCA || rd8(pc+1)==0xCB) && rd8(pc+2)==0x10) {
                 uint32_t *r=rd8(pc+1)==0xC9?&ecx:(rd8(pc+1)==0xCA?&edx:&ebx);
                 *r=(*r>>16)|(*r<<16); pc+=3;
             }
-            else if (op==0x8A && rd8(pc+1)==0x3C && rd8(pc+2)==0x28) { reg8_set(&eax,&ecx,&edx,&ebx,7,scode_rd8(eax+ebp)); pc+=3; }
-            else if (op==0x89 && rd8(pc+1)==0x1F) { scode_wr32(edi,ebx); pc+=2; }
+            else if (op==0x8A && rd8(pc+1)==0x3C && rd8(pc+2)==0x28) { reg8_set(&eax,&ecx,&edx,&ebx,7,scode_rd8(eax+ebp,base_span)); pc+=3; }
+            else if (op==0x89 && rd8(pc+1)==0x1F) { scode_wr32(edi,ebx,dst_span); pc+=2; }
             else if (op==0xE9) {
                 int32_t rel=(int32_t)rd32(pc+1); target=pc+5u+(uint32_t)rel;
                 if (target==0x15030D30u || target==0x15030D50u) {
@@ -375,6 +384,30 @@ static int range_2d(uint32_t base,uint32_t rows,uint32_t rowbytes,uint32_t delta
     if (!rows || first<0 || first>0xFFFFFFFFLL || length>0xFFFFFFFFu || first+ (int64_t)length>0x100000000LL) return 0;
     return proc_range((uint32_t)first,(uint32_t)length,write_access);
 }
+/* Validate the bounding span of every row touched by the selected Storm stub.
+ * D50 alternates its ordinary delta and the absolute interlaced pitch fields. */
+static int validate_rows(uint32_t base,uint32_t rows,uint32_t width,uint32_t delta,
+                         uint32_t alternate_delta,int interlaced,int write_access,ScSpan *out) {
+    uint32_t r,addr=base; uint64_t low=UINT64_MAX,high=0;
+    if (!rows || !width) return 0;
+    for (r=0;r<rows;r++) {
+        uint64_t end=(uint64_t)addr+width;
+        if (end>0x100000000ull) return 0;
+        if (addr<low) low=addr;
+        if (end>high) high=end;
+        if (r+1u<rows) {
+            int64_t step;
+            if (interlaced && ((rows-r)&1u)) step=(int64_t)width+(int32_t)alternate_delta;
+            else step=(int64_t)width+(int32_t)delta;
+            { int64_t next=(int64_t)(uint64_t)addr+step;
+              if(next<0 || next>0xFFFFFFFFLL) return 0;
+              addr=(uint32_t)next; }
+        }
+    }
+    if (high<=low || high-low>0xFFFFFFFFull || !proc_range((uint32_t)low,(uint32_t)(high-low),write_access)) return 0;
+    if (out) { out->lo=(uint32_t)low; out->hi=(uint32_t)high; out->valid=1; }
+    return 1;
+}
 static int match_2x_lut_kernel(uint32_t code1,uint32_t size1,uint32_t code2,uint32_t size2,
                                uint32_t width,uint32_t entry,uint32_t target,uint32_t loop_target) {
     static const uint8_t prefix[]={
@@ -390,6 +423,121 @@ static int match_2x_lut_kernel(uint32_t code1,uint32_t size1,uint32_t code2,uint
     if (rd8(code2+0x1680u)!=0xE9) return 0;
     for(i=0;i<320u;i++) if (memcmp((const void *)(unsigned long)(code2+i*18u),op,sizeof op)!=0) return 0;
     return 1;
+}
+/* Exact 1x byte-LUT kernel seen in scode-0x4a-0x2bc5.hex (plus its mirror
+ * 8A 0E 8A 17 / 8B 0E 8B 17). Covers both unaligned (prefix||r) and aligned
+ * (prefix==0 && r==0, where storm_334 enters code2 directly). */
+static int match_1x_lut_kernel(uint32_t flags,uint32_t descriptor_flags,uint32_t base,
+                               uint32_t code1,uint32_t size1,uint32_t code2,uint32_t size2,
+                               uint32_t code3,uint32_t size3,uint32_t entry,
+                               uint32_t target1,uint32_t target2,uint32_t target3,uint32_t width,uint32_t dst) {
+    static const uint8_t pixel_a[23]={
+        0xC7,0xC0,0,0,0,0, 0x8A,0x0F, 0x8A,0x16, 0x8A,0xC1, 0x8A,0xE2,
+        0xFF,0xC6, 0x8A,0x04,0x28, 0x88,0x07, 0xFF,0xC7
+    };
+    static const uint8_t pixel_b[23]={
+        0xC7,0xC0,0,0,0,0, 0x8A,0x0E, 0x8A,0x17, 0x8A,0xC1, 0x8A,0xE2,
+        0xFF,0xC6, 0x8A,0x04,0x28, 0x88,0x07, 0xFF,0xC7
+    };
+    static const uint8_t block_a[70]={
+        0xC7,0xC0,0,0,0,0, 0x8B,0x0F,0x8B,0x16,0x8A,0xC1,0x8A,0xE2,
+        0x81,0xC6,4,0,0,0, 0x8A,0x1C,0x28,0x8A,0xC5,0x8A,0xE6,0xC1,0xC9,0x10,
+        0x8A,0x3C,0x28,0x8A,0xC1,0xC1,0xCA,0x10,0xC1,0xCB,0x10,
+        0x8A,0xE2,0x8A,0x1C,0x28,0x8A,0xC5,0xC1,0xC9,0x10,0x8A,0xE6,
+        0xC1,0xCA,0x10,0x8A,0x3C,0x28,0xC1,0xCB,0x10,0x89,0x1F,
+        0x81,0xC7,4,0,0,0
+    };
+    static const uint8_t block_b[70]={
+        0xC7,0xC0,0,0,0,0, 0x8B,0x0E,0x8B,0x17,0x8A,0xC1,0x8A,0xE2,
+        0x81,0xC6,4,0,0,0, 0x8A,0x1C,0x28,0x8A,0xC5,0x8A,0xE6,0xC1,0xC9,0x10,
+        0x8A,0x3C,0x28,0x8A,0xC1,0xC1,0xCA,0x10,0xC1,0xCB,0x10,
+        0x8A,0xE2,0x8A,0x1C,0x28,0x8A,0xC5,0xC1,0xC9,0x10,0x8A,0xE6,
+        0xC1,0xCA,0x10,0x8A,0x3C,0x28,0xC1,0xCB,0x10,0x89,0x1F,
+        0x81,0xC7,4,0,0,0
+    };
+    uint32_t i,prefix,q,r,expected_entry,expected_body,expected_tail;
+    if (flags!=0x40u || !base || (descriptor_flags&0x04000000u) ||
+        !(descriptor_flags&0x00040000u) || size1!=0x4Au || size2!=0x2BC5u ||
+        !width || width>640u) return 0;
+    prefix=(4u-(dst&3u))&3u;
+    if(prefix>width) prefix=width;
+    q=(width-prefix)>>2; r=(width-prefix)&3u;
+    if(q>160u) return 0;
+    expected_body=code2+(160u-q)*70u;
+    if(!prefix && !r && entry==expected_body && target2==0x15030D30u) {
+        if(!proc_range(code2,size2,0)) return 0;
+    } else {
+        if(size3!=0x4Au || target3!=0x15030D30u) return 0;
+        expected_entry=code1+(3u-prefix)*23u;
+        expected_tail=code3+(3u-r)*23u;
+        if(entry!=expected_entry || target1!=expected_body || target2!=expected_tail) return 0;
+        if(!proc_range(code1,size1,0) || !proc_range(code2,size2,0) || !proc_range(code3,size3,0)) return 0;
+        if(rd8(code1+69u)!=0xE9 || rd8(code3+69u)!=0xE9) return 0;
+        if(code1+size1+(int32_t)rd32(code1+70u)!=target1) return 0;
+        if(code3+size3+(int32_t)rd32(code3+size3-4u)!=target3) return 0;
+    }
+    if(rd8(code2+11200u)!=0xE9) return 0;
+    if(code2+size2+(int32_t)rd32(code2+size2-4u)!=target2) return 0;
+    { const uint8_t *px_tmpl=0, *blk_tmpl=0;
+      if(memcmp((const void *)(unsigned long)code2,block_a,sizeof block_a)==0) {
+          blk_tmpl=block_a; px_tmpl=pixel_a;
+      } else if(memcmp((const void *)(unsigned long)code2,block_b,sizeof block_b)==0) {
+          blk_tmpl=block_b; px_tmpl=pixel_b;
+      } else return 0;
+      for(i=1u;i<160u;i++) {
+          if(memcmp((const void *)(unsigned long)(code2+i*70u),blk_tmpl,70u)!=0) return 0;
+      }
+      if(entry!=expected_body) {
+          for(i=0;i<3u;i++) {
+              if(memcmp((const void *)(unsigned long)(code1+i*23u),px_tmpl,23u)!=0) return 0;
+              if(memcmp((const void *)(unsigned long)(code3+i*23u),px_tmpl,23u)!=0) return 0;
+          }
+      }
+      return 1;
+    }
+}
+static uint32_t load_le32_bytes(const uint8_t *p) {
+    return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);
+}
+static uint8_t lut_reg_lookup(const uint8_t *lut,uint32_t eax) {
+    return lut[((eax>>8)&0xFFu)*256u+(eax&0xFFu)];
+}
+static void run_1x_lut(_cpu *cpu,uint32_t entry,uint32_t a2,uint32_t rows,uint32_t width,
+                       uint32_t dst_delta,uint32_t src_delta,uint32_t prefix) {
+    uint32_t y,src=rd32(a2+28),dst=rd32(a2+24),lutbase=rd32(a2+32);
+    uint32_t ebx=entry,ecx=rows,edx=cpu->_edx;
+    const uint8_t *lut=(const uint8_t *)(unsigned long)lutbase;
+    uint32_t q=(width-prefix)>>2;
+    for(y=0;y<rows;y++) {
+        const uint8_t *s=(const uint8_t *)(unsigned long)src;
+        uint8_t *d=(uint8_t *)(unsigned long)dst;
+        uint32_t x, last_row=(y+1u==rows);
+        uint32_t last_dc=0, last_sc=0; uint8_t last_px_d=0, last_px_s=0, last_tail_d=0, last_tail_s=0;
+        if(last_row) {
+            if(prefix) { last_px_d=d[prefix-1u]; last_px_s=s[prefix-1u]; }
+            if(q) { uint32_t qb=prefix+(q-1u)*4u; last_dc=load_le32_bytes(d+qb); last_sc=load_le32_bytes(s+qb); }
+            if(prefix+q*4u<width) { last_tail_d=d[width-1u]; last_tail_s=s[width-1u]; }
+        }
+        for(x=0;x<prefix;x++) d[x]=lut[((uint32_t)s[x]<<8)|d[x]];
+        for(;x<prefix+q*4u;x+=4u) {
+            d[x+0u]=lut[((uint32_t)s[x+0u]<<8)|d[x+0u]];
+            d[x+1u]=lut[((uint32_t)s[x+1u]<<8)|d[x+1u]];
+            d[x+2u]=lut[((uint32_t)s[x+2u]<<8)|d[x+2u]];
+            d[x+3u]=lut[((uint32_t)s[x+3u]<<8)|d[x+3u]];
+        }
+        for(;x<width;x++) d[x]=lut[((uint32_t)s[x]<<8)|d[x]];
+        if(last_row) {
+            if(prefix) { ecx=(ecx&0xFFFFFF00u)|last_px_d; edx=(edx&0xFFFFFF00u)|last_px_s; }
+            if(q) {
+                uint32_t qb=prefix+(q-1u)*4u;
+                ebx=load_le32_bytes(d+qb); ecx=last_dc; edx=last_sc;
+            }
+            if(prefix+q*4u<width) { ecx=(ecx&0xFFFFFF00u)|last_tail_d; edx=(edx&0xFFFFFF00u)|last_tail_s; }
+        } else { src+=width+src_delta; dst+=width+dst_delta; }
+    }
+    (void)lut_reg_lookup;
+    cpu->_eax=1; cpu->_ecx=ecx; cpu->_edx=edx; cpu->_ebx=ebx;
+    wr32(a2+36,ecx); wr32(a2+40,edx); wr32(a2+44,ebx);
 }
 /* C translation of the fully fingerprinted 2x byte->word LUT SCode above.
  * It is gated by every generated operation, both lengths, width, and patched continuation. */
@@ -416,6 +564,8 @@ static void run_2x_lut(_cpu *cpu,uint32_t entry,uint32_t a2,uint32_t rows,uint32
 
 void storm_334_arm_body(_cpu *cpu) {
     uint32_t a[2],p,code1,code2,code3,size1,size2,size3,width,rows,dst,src,dst_delta,src_delta,base,flags,ret;
+    uint32_t descriptor_flags,stub;
+    ScSpan src_span={0,0,0},dst_span={0,0,0},base_span={0,0,0};
     ret=args_and_relocate_return(cpu,2,a); (void)ret;
     p=a[1];
     if (!proc_range(a[0],0x4c,0) || !proc_range(p,0x38,1)) fail73("storm_334 descriptors",0,0);
@@ -430,9 +580,16 @@ void storm_334_arm_body(_cpu *cpu) {
         log_s("[storm-scode] code2/size2="); log_hex(code2); log_hex(size2);
         fail73("SCode buffers",0,flags);
     }
-    if (!proc_range(dst,(rows-1u)*(width+dst_delta)+width,1) ||
-        !proc_range(src,(rows-1u)*(width+src_delta)+width,0)) fail73("surface range",0,flags);
+    descriptor_flags=rd32(a[0]+8);
+    stub=(descriptor_flags&0x04000000u)?0x15030D50u:0x15030D30u;
+    if (!validate_rows(dst,rows,width,dst_delta,rd32(p+48),
+                       (descriptor_flags&0x04000000u)!=0,1,&dst_span) ||
+        !validate_rows(src,rows,width,src_delta,rd32(p+52),
+                       (descriptor_flags&0x04000000u)!=0,0,&src_span)) fail73("surface range",0,flags);
     base=rd32(p+32);
+    if (base && proc_range(base,65536u,0)) {
+        base_span.lo=base; base_span.hi=base+65536u; base_span.valid=(base_span.hi>base);
+    }
     /* Opt-in diagnostic capture for the reported hover kernel; preserve exact bytes
      * before storm_334 patches its generated jump slots. */
     if (getenv("SC_SCODE_DUMP") && size1==0x4Au && size2==0x2BC5u) {
@@ -452,8 +609,7 @@ void storm_334_arm_body(_cpu *cpu) {
     /* Patch the selected generated kernel exactly as storm_334 does (IDA
      * 0x15030AD4-0x15030CEA), including its alignment/prefix tables. */
     {
-      uint32_t descriptor_flags=rd32(a[0]+8), old_width=rd32(a[0]+12);
-      uint32_t stub=(descriptor_flags&0x04000000u)?0x15030D50u:0x15030D30u;
+      uint32_t old_width=rd32(a[0]+12);
       uint32_t selected=old_width;
       if (descriptor_flags&0x00040000u) {
         uint32_t align=rd32(p+24)&3u, prefix=(4u-align)&3u, remain,q,r;
@@ -501,7 +657,23 @@ void storm_334_arm_body(_cpu *cpu) {
           fail73("SCode entry outside code buffers",0,entry);
       if (scode_trace_on()) { log_s("[storm-scode] entry="); log_hex(entry); }
       { uint32_t target2=code2+size2+(int32_t)rd32(code2+size2-4u);
-      if (match_2x_lut_kernel(code1,size1,code2,size2,width,entry,target,target2)) {
+        uint32_t target3=(size3>=4u && proc_range(code3,size3,0))?
+                         code3+size3+(int32_t)rd32(code3+size3-4u):0;
+      if (match_1x_lut_kernel(flags,descriptor_flags,base,code1,size1,code2,size2,code3,size3,
+                              entry,target,target2,target3,width,dst) && base_span.valid) {
+          if (!spans_overlap(&src_span,&dst_span) && !spans_overlap(&base_span,&dst_span) &&
+              !spans_overlap(&base_span,&src_span)) {
+              static int announced_1x;
+              uint32_t pref=(4u-(dst&3u))&3u;
+              if (pref>width) pref=width;
+              if (!announced_1x) { announced_1x=1; log_s("[storm-scode] fast-path C 1x LUT attivo\n"); }
+              if (scode_trace_on()) log_s("[storm-scode] fast-path C 1x LUT attivo\n");
+              run_1x_lut(cpu,entry,p,rows,width,dst_delta,src_delta,pref);
+          } else {
+              run_scode(cpu,entry,code1,size1,code2,size2,code3,size3,p,dst_delta,src_delta,
+                        &src_span,&dst_span,&base_span);
+          }
+      } else if (match_2x_lut_kernel(code1,size1,code2,size2,width,entry,target,target2)) {
           static int announced;
           if (!proc_range(base,65536,0)) fail73("fingerprinted 2x SCode LUT",0,base);
           if (!announced) { announced=1; log_s("[storm-scode] fast-path C 2x LUT attivo\n"); }
@@ -515,7 +687,8 @@ void storm_334_arm_body(_cpu *cpu) {
               log_s("[storm-scode] kernel fuori fingerprint 2x: interpreter (size1/size2/width/flags)=");
               log_hex(size1); log_hex(size2); log_hex(width); log_hex(rd32(a[0]+8));
           }
-          run_scode(cpu,entry,code1,size1,code2,size2,code3,size3,p,dst_delta,src_delta);
+          run_scode(cpu,entry,code1,size1,code2,size2,code3,size3,p,dst_delta,src_delta,
+                    &src_span,&dst_span,&base_span);
       }
       }
     }

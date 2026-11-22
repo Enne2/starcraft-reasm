@@ -561,6 +561,8 @@ S int VerQueryValueA(const void *block, const char *sub, void **ptr, unsigned in
  * Le finestre hanno hwnd sintetici, gerarchia, GWL_*, proprieta' stringa e un canvas 8 bit.
  * ==========================================================================*/
 #define MAX_WIN 96
+#define WIN_CHUNK 32
+#define WIN_CHUNKS ((MAX_WIN + WIN_CHUNK - 1) / WIN_CHUNK)
 
 /* definiti piu' sotto (coda messaggi); servono a ShowWindow per consegnare l'attivazione */
 __attribute__((stdcall)) int PostMessageA(unsigned int, unsigned int, unsigned int, unsigned int);
@@ -590,22 +592,53 @@ typedef struct {
     int activated;            /* WM_ACTIVATEAPP gia' consegnato */
 } UiWin;
 
-static UiWin g_win[MAX_WIN];
+/* Allocati a chunk per mantenere stabili gli indirizzi UiWin anche se callback annidate creano
+ * altre finestre. HWND sono ID sintetici, non puntatori agli slot. */
+static UiWin *g_win_chunks[WIN_CHUNKS];
+static UiWin g_win_empty;
 static unsigned int g_next_hwnd = 0x10001u;
+
+static UiWin *win_slot(unsigned int i) {
+    UiWin *chunk;
+    if (i >= MAX_WIN) return &g_win_empty;
+    chunk = g_win_chunks[i / WIN_CHUNK];
+    return chunk ? &chunk[i % WIN_CHUNK] : &g_win_empty;
+}
+
+static UiWin *win_slot_create(unsigned int i) {
+    unsigned int chunk_index = i / WIN_CHUNK, j;
+    UiWin *chunk;
+    if (i >= MAX_WIN) return 0;
+    chunk = g_win_chunks[chunk_index];
+    if (!chunk) {
+        chunk = (UiWin *)malloc(sizeof(*chunk) * WIN_CHUNK);
+        if (!chunk) return 0;
+        memset(chunk, 0, sizeof(*chunk) * WIN_CHUNK);
+        g_win_chunks[chunk_index] = chunk;
+    }
+    j = i % WIN_CHUNK;
+    return &chunk[j];
+}
 static unsigned int g_foreground, g_active, g_focus, g_capture, g_saved_focus;
 static unsigned int g_game_hwnd, g_paint_tick;
 static int g_paint_pending, g_input_pumping, g_cursor_count;
 
 static UiWin *win_of(unsigned int h) {
     int i;
-    for (i = 0; i < MAX_WIN; ++i) if (g_win[i].used && g_win[i].hwnd == h) return &g_win[i];
+    for (i = 0; i < MAX_WIN; ++i) {
+        UiWin *w = win_slot((unsigned int)i);
+        if (w->used && w->hwnd == h) return w;
+    }
     return 0;
 }
 static UiWin *win_new(unsigned int parent, int is_child, const char *cls, const char *title,
                       unsigned int style, int x, int y, int w, int h) {
     int i;
     UiWin *wn = 0;
-    for (i = 0; i < MAX_WIN; ++i) if (!g_win[i].used) { wn = &g_win[i]; break; }
+    for (i = 0; i < MAX_WIN; ++i) if (!win_slot((unsigned int)i)->used) {
+        wn = win_slot_create((unsigned int)i);
+        break;
+    }
     if (!wn) return 0;
     memset(wn, 0, sizeof *wn);
     wn->used = 1;
@@ -657,16 +690,16 @@ S unsigned int GetParent(unsigned int h) { UiWin *w = win_of(h); return w ? w->p
 S unsigned int GetTopWindow(unsigned int h) {
     int i;
     for (i = 0; i < MAX_WIN; ++i)
-        if (g_win[i].used && g_win[i].parent == h) return g_win[i].hwnd;
+        if (win_slot((unsigned int)i)->used && win_slot((unsigned int)i)->parent == h) return win_slot((unsigned int)i)->hwnd;
     return 0;
 }
 S unsigned int GetWindow(unsigned int h, unsigned int cmd) {
     UiWin *w = win_of(h); unsigned int best=0; int i;
     if (!w) return 0;
-    if (cmd==5) { for(i=0;i<MAX_WIN;++i) if(g_win[i].used && g_win[i].is_child && g_win[i].parent==h && (!best || g_win[i].hwnd<best)) best=g_win[i].hwnd; return best; }
+    if (cmd==5) { for(i=0;i<MAX_WIN;++i) { UiWin *p=win_slot((unsigned int)i); if(p->used && p->is_child && p->parent==h && (!best || p->hwnd<best)) best=p->hwnd; } return best; }
     if (cmd==4) return w->is_child ? 0 : w->parent;
     for(i=0;i<MAX_WIN;++i) {
-        UiWin *p=&g_win[i];
+        UiWin *p=win_slot((unsigned int)i);
         if(!p->used || p->parent!=w->parent || p->is_child!=w->is_child) continue;
         if ((cmd==0 || (cmd==2 && p->hwnd>h)) && (!best || p->hwnd<best)) best=p->hwnd;
         if ((cmd==1 || (cmd==3 && p->hwnd<h)) && (!best || p->hwnd>best)) best=p->hwnd;
@@ -718,7 +751,7 @@ S int ShowWindow(unsigned int h, int cmd) {
 S unsigned int GetDlgItem(unsigned int h, int id) {
     int i;
     for (i = 0; i < MAX_WIN; ++i)
-        if (g_win[i].used && g_win[i].parent == h && (int) g_win[i].id == id) return g_win[i].hwnd;
+        if (win_slot((unsigned int)i)->used && win_slot((unsigned int)i)->parent == h && (int) win_slot((unsigned int)i)->id == id) return win_slot((unsigned int)i)->hwnd;
     return 0;
 }
 S int GetDlgCtrlID(unsigned int h) { UiWin *w = win_of(h); return w ? (int) w->id : 0; }
@@ -993,8 +1026,8 @@ void win32_input_pump(void) {
      * not a valid fallback. Keep draining events for the visible modal window. */
     if(!w || !w->enabled) {
         top=0;
-        for(i=0;i<MAX_WIN;++i) if(g_win[i].used && !g_win[i].is_child &&
-            g_win[i].visible && g_win[i].enabled && g_win[i].hwnd>top) top=g_win[i].hwnd;
+        for(i=0;i<MAX_WIN;++i) { UiWin *p=win_slot((unsigned int)i); if(p->used && !p->is_child &&
+            p->visible && p->enabled && p->hwnd>top) top=p->hwnd; }
         w=win_of(top);
     }
     if(w && w->enabled) {
@@ -1018,13 +1051,13 @@ void win32_input_pump(void) {
                 else {
                     int best=-1;
                     for(i=0;i<MAX_WIN;++i) {
-                        UiWin *c=&g_win[i]; int r[4];
+                        UiWin *c=win_slot((unsigned int)i); int r[4];
                         if(!c->used || !c->is_child || c->parent!=top || !c->visible || !c->enabled) continue;
                         GetWindowRect(c->hwnd,r);
                         if(e.x>=r[0] && e.x<r[2] && e.y>=r[1] && e.y<r[3]) best=i;
                     }
                     if(best>=0) {
-                        int r[4]; target=g_win[best].hwnd; GetWindowRect(target,r); e.x-=r[0]; e.y-=r[1];
+                        int r[4]; target=win_slot((unsigned int)best)->hwnd; GetWindowRect(target,r); e.x-=r[0]; e.y-=r[1];
                     }
                 }
             } else if(e.type==HOST_INPUT_KEYDOWN || e.type==HOST_INPUT_KEYUP || e.type==HOST_INPUT_TEXT) {
@@ -1410,7 +1443,7 @@ S int DestroyWindow(unsigned int h) {
     if (!w || w->used == 2) return 0;
     w->used = 2; /* guard recursive destruction; still visible to WM_DESTROY */
     SendMessageA(h, 2, 0, 0);
-    for (i=0;i<MAX_WIN;++i) if (g_win[i].used == 1 && g_win[i].is_child && g_win[i].parent == h) DestroyWindow(g_win[i].hwnd);
+    for (i=0;i<MAX_WIN;++i) { UiWin *child=win_slot((unsigned int)i); if (child->used == 1 && child->is_child && child->parent == h) DestroyWindow(child->hwnd); }
     SendMessageA(h, 0x82, 0, 0);
     dlg_elf_destroyed(h);
     for (i=0;i<w->item_count;++i) free(w->items[i]);

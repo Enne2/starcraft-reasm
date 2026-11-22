@@ -15,17 +15,20 @@
 #include "host_elf.h"
 #include "reasm_elf.h"          /* log del runtime (toolkit) */
 #include "win32_shim.h"         /* timer Win32: consegna dei TIMERPROC dal pump */
+#include <sys/stat.h>              /* identita' del control-file e rilevamento rotazione */
 
 /* ---- libc dinamica (niente header: si resta freestanding) ---- */
 extern void *malloc(unsigned long);
 extern void free(void *);
 extern void *memset(void *, int, unsigned long);
 extern void *memcpy(void *, const void *, unsigned long);
+extern int memcmp(const void *, const void *, unsigned long);
 extern unsigned long pthread_self(void);
 extern char *getenv(const char *);
 extern int strcmp(const char *, const char *);
 extern int snprintf(char *, unsigned long, const char *, ...);
 extern int sscanf(const char *, const char *, ...);
+extern long atol(const char *);
 extern int open(const char *, int, ...);
 extern long read(int, void *, unsigned long);
 extern int close(int);
@@ -325,8 +328,13 @@ void host_elf_cursor_visible(int on) { if(host_elf_input_owner()) SDL_ShowCursor
 static unsigned int g_pal[256];      /* voci 0x00RRGGBB */
 static int g_pal_dirty = 1;
 static void *g_gl_context;
-static int g_gl_requested, g_gl_failed;
+static int g_gl_requested, g_gl_failed, g_gl_explicit;
 static int gl_ready;
+static unsigned char *g_present_snapshot;
+static unsigned long g_present_snapshot_size;
+static unsigned int g_presented_at;
+static unsigned int g_present_palette[256];
+static int g_present_snapshot_valid, g_present_force = 1;
 static int g_pal_set;                /* 0 = nessuna palette impostata (default: scala di grigi) */
 static unsigned int g_map[256];      /* palette -> pixel nel formato della finestra */
 static int g_map_valid;
@@ -364,7 +372,9 @@ int host_elf_init(const char *title) {
     g_w = g_h = g_pitch = 0; g_bpp = 8;
     g_want_fullscreen = g_is_fullscreen = 0;
     g_pal_set = 0; g_map_valid = 0; g_map_fmt = 0;
-    g_pal_dirty = 1; g_gl_failed = 0;
+    g_pal_dirty = 1; g_gl_failed = 0; g_gl_explicit = 0;
+    g_present_snapshot_valid = 0; g_present_force = 1;
+    g_presented_at = 0;
     { int i; for (i = 0; i < 256; ++i) g_pal[i] = (unsigned int) (i * 0x010101u); }
     if (g_inited) return 0;
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -385,6 +395,8 @@ static int canvas_alloc(int w, int h) {
     if (w <= 0 || h <= 0) return -1;
     size = (unsigned long) pitch * (unsigned long) h;
     if (g_canvas) { free(g_canvas); g_canvas = 0; }
+    if (g_present_snapshot) { free(g_present_snapshot); g_present_snapshot = 0; }
+    g_present_snapshot_size = size; g_present_snapshot_valid = 0; g_present_force = 1;
     g_canvas = (unsigned char *) malloc(size);
     if (!g_canvas) { g_err = "malloc canvas"; return -1; }
     memset(g_canvas, 0, size);
@@ -404,19 +416,20 @@ int host_elf_display_mode(int w, int h, int bpp) {
         unsigned int flags = SDL_WINDOW_SHOWN;
         const char *present = getenv("SC_PRESENT");
         const char *driver = SDL_GetCurrentVideoDriver();
-        g_gl_requested = (present && present[0] == 'g' && present[1] == 'l') ||
-                         (!present && driver && strcmp(driver, "dummy") != 0);
+        g_gl_explicit = present && present[0] == 'g' && present[1] == 'l' && present[2] == 0;
+        g_gl_requested = g_gl_explicit ||
+                         ((!present || (present[0] == 'a' && present[1] == 'u' &&
+                                        present[2] == 't' && present[3] == 'o' && !present[4])) &&
+                          driver && strcmp(driver, "dummy") != 0);
         if (g_gl_requested) {
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+            /* Il profilo viene scelto per ogni tentativo in gl_context_attempt(). */
             flags |= SDL_WINDOW_OPENGL;
         }
         if (g_want_fullscreen) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
         g_win = SDL_CreateWindow(g_title, (int) SDL_WINDOWPOS_UNDEFINED, (int) SDL_WINDOWPOS_UNDEFINED,
                                  w, h, flags);
         if (!g_win && (flags & SDL_WINDOW_OPENGL)) {
-            reasm_elf_log("[host] SDL OpenGL window non disponibile, retry senza GL\n");
+            reasm_elf_log("[host] GL SDL_CreateWindow OpenGL fallita: "); reasm_elf_log(SDL_GetError()); reasm_elf_log("; retry senza GL\n");
             g_gl_requested = 0; g_gl_failed = 1;
             flags &= ~SDL_WINDOW_OPENGL;
             g_win = SDL_CreateWindow(g_title, (int)SDL_WINDOWPOS_UNDEFINED, (int)SDL_WINDOWPOS_UNDEFINED, w, h, flags);
@@ -438,7 +451,7 @@ int host_elf_display_mode(int w, int h, int bpp) {
         reasm_elf_log("[host] finestra creata\n");
     } else if (w != g_w || h != g_h) {
         SDL_SetWindowSize(g_win, w, h);
-        g_map_valid = 0;
+        g_map_valid = 0; g_present_force = 1;
     }
     g_bpp = 8;
     return canvas_alloc(w, h);
@@ -451,7 +464,9 @@ void host_elf_shutdown(void) {
     g_locked = 0; g_w = g_h = g_pitch = 0;
     if (g_win) { SDL_DestroyWindow(g_win); g_win = 0; }
     g_map_valid = 0; g_map_fmt = 0;
-    gl_ready = 0; g_gl_requested = 0; g_gl_failed = 0;
+    gl_ready = 0; g_gl_requested = 0; g_gl_failed = 0; g_gl_explicit = 0;
+    if (g_present_snapshot) { free(g_present_snapshot); g_present_snapshot = 0; }
+    g_present_snapshot_valid = 0; g_present_force = 1;
     if (g_inited || g_audio_inited) { SDL_Quit(); g_inited = 0; g_audio_inited = 0; }
 }
 
@@ -467,7 +482,7 @@ int host_elf_coop_level(unsigned long hwnd, unsigned long flags) {
     if (g_win && g_want_fullscreen != g_is_fullscreen) {
         SDL_SetWindowFullscreen(g_win, g_want_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0u);
         g_is_fullscreen = g_want_fullscreen;
-        g_map_valid = 0;
+        g_map_valid = 0; g_present_force = 1;
     }
     return 0;
 }
@@ -763,6 +778,7 @@ typedef void (*PFNGLDISABLE)(GLu);
 typedef void (*PFNGLREADPIXELS)(GLi, GLi, GLi, GLi, GLu, GLu, void *);
 typedef void (*PFNGLDRAWARRAYS)(GLu, GLi, GLi);
 typedef const unsigned char *(*PFNGLGETSTRING)(GLu);
+typedef void (*PFNGLGETINFOLOG)(GLu, GLi, GLi *, char *);
 typedef struct {
     PFNGLGEN gen; PFNGLBIND bind; PFNGLPARAMI parami; PFNGLTEXIMAGE2D teximage;
     PFNGLTEXSUBIMAGE2D texsub; PFNGLPIXELSTOREI pixelstore; PFNGLCREATESHADER creates;
@@ -773,56 +789,133 @@ typedef struct {
     PFNGLATTRIBPTR attribptr; PFNGLACTIVETEXTURE activetexture; PFNGLVIEWPORT viewport; PFNGLCLEARCOLOR clearcolor;
     PFNGLCLEAR clear; PFNGLDISABLE disable; PFNGLREADPIXELS readpixels;
     PFNGLDRAWARRAYS draw; PFNGLGETSTRING getstring;
+    PFNGLGETINFOLOG shaderlog, programlog;
 } GlApi;
 static GlApi gl;
 static GLu gl_idx_tex, gl_pal_tex, gl_program;
 static GLi gl_pos_attr, gl_uv_attr, gl_idx_uniform, gl_pal_uniform;
 static unsigned char gl_palette[256 * 4];
 static void *gl_proc(const char *n) { return SDL_GL_GetProcAddress(n); }
-#define GL_LOAD(field, name) do { gl.field = (void *) gl_proc(name); if (!gl.field) return -1; } while (0)
+#define GL_LOAD(field, name) do { gl.field = (void *) gl_proc(name); if (!gl.field) { gl_log_missing(name); return -1; } } while (0)
 
-static int gl_init(void) {
-    const char *version;
-    const char *vs = "attribute vec2 a_pos; attribute vec2 a_uv; varying vec2 v_uv; void main(){gl_Position=vec4(a_pos,0.0,1.0);v_uv=a_uv;}";
-    const char *fs100 = "precision mediump float; varying vec2 v_uv; uniform sampler2D u_idx; uniform sampler2D u_pal; void main(){float idx=floor(texture2D(u_idx,v_uv).r*255.0+0.5); gl_FragColor=texture2D(u_pal,vec2((idx+0.5)/256.0,0.5));}";
-    const char *fs120 = "varying vec2 v_uv; uniform sampler2D u_idx; uniform sampler2D u_pal; void main(){float idx=floor(texture2D(u_idx,v_uv).r*255.0+0.5); gl_FragColor=texture2D(u_pal,vec2((idx+0.5)/256.0,0.5));}";
-    const char *fs;
+static void gl_log_missing(const char *name);
+static int contains_ci(const char *text, const char *needle) {
+    int i, j;
+    if (!text || !needle || !*needle) return 0;
+    for (i = 0; text[i]; ++i) {
+        for (j = 0; needle[j] && text[i+j]; ++j) {
+            char a = text[i+j], b = needle[j];
+            if (a >= 'A' && a <= 'Z') a = (char)(a + ('a' - 'A'));
+            if (b >= 'A' && b <= 'Z') b = (char)(b + ('a' - 'A'));
+            if (a != b) break;
+        }
+        if (!needle[j]) return 1;
+    }
+    return 0;
+}
+static int g_gl_software;
+static int software_gl_renderer(const char *renderer) {
+    return contains_ci(renderer, "llvmpipe") || contains_ci(renderer, "softpipe") ||
+           contains_ci(renderer, "swrast") || contains_ci(renderer, "swiftshader") ||
+           contains_ci(renderer, "microsoft basic render driver");
+}
+
+static const char *g_gl_profile = "unset";
+static void gl_log(const char *s) { reasm_elf_log("[host] GL "); reasm_elf_log(s); }
+static void gl_log_missing(const char *name) {
+    gl_log("proc mancante: "); reasm_elf_log(name); reasm_elf_log("\n");
+}
+static void gl_log_info(const char *kind, GLu object, PFNGLGETINFOLOG fn) {
+    char info[1024]; GLi n = 0;
+    info[0] = 0; fn(object, (GLi)sizeof info - 1, &n, info);
+    if (n < 0) n = 0; if (n >= (GLi)sizeof info) n = (GLi)sizeof info - 1;
+    info[n] = 0;
+    gl_log(kind); gl_log(": "); reasm_elf_log(info[0] ? info : "(info log vuoto)"); reasm_elf_log("\n");
+}
+static int gl_context_attempt(const char *profile, int major, int minor, int mask,
+                              const char *vs, const char *fs) {
+    const char *version, *renderer, *vendor;
     GLu shv, shf;
     GLi ok = 0;
-    if (gl_ready) return 0;
-    if (!g_gl_context) {
-        g_gl_context = SDL_GL_CreateContext(g_win);
-        if (!g_gl_context) return -1;
-        SDL_GL_SetSwapInterval(0);
+    g_gl_profile = profile;
+    if (SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, major) != 0 ||
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, minor) != 0 ||
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, mask) != 0) {
+        gl_log("SDL_GL_SetAttribute "); reasm_elf_log(profile); reasm_elf_log(" fallita: ");
+        reasm_elf_log(SDL_GetError()); reasm_elf_log("\n"); return -1;
     }
+    g_gl_context = SDL_GL_CreateContext(g_win);
+    if (!g_gl_context) {
+        gl_log("SDL_GL_CreateContext "); reasm_elf_log(profile); reasm_elf_log(" fallita: ");
+        reasm_elf_log(SDL_GetError()); reasm_elf_log("\n"); return -1;
+    }
+    SDL_GL_SetSwapInterval(0);
     GL_LOAD(gen,"glGenTextures"); GL_LOAD(bind,"glBindTexture"); GL_LOAD(parami,"glTexParameteri");
     GL_LOAD(teximage,"glTexImage2D"); GL_LOAD(texsub,"glTexSubImage2D"); GL_LOAD(pixelstore,"glPixelStorei");
     GL_LOAD(creates,"glCreateShader"); GL_LOAD(source,"glShaderSource"); GL_LOAD(compile,"glCompileShader");
-    GL_LOAD(shaderiv,"glGetShaderiv"); GL_LOAD(createprog,"glCreateProgram"); GL_LOAD(attach,"glAttachShader");
-    GL_LOAD(link,"glLinkProgram"); GL_LOAD(programiv,"glGetProgramiv"); GL_LOAD(use,"glUseProgram");
-    GL_LOAD(attrib,"glGetAttribLocation"); GL_LOAD(uniform,"glGetUniformLocation"); GL_LOAD(uniformi,"glUniform1i");
-    GL_LOAD(enableattrib,"glEnableVertexAttribArray"); GL_LOAD(attribptr,"glVertexAttribPointer");
-    GL_LOAD(activetexture,"glActiveTexture");
+    GL_LOAD(shaderiv,"glGetShaderiv"); GL_LOAD(shaderlog,"glGetShaderInfoLog");
+    GL_LOAD(createprog,"glCreateProgram"); GL_LOAD(attach,"glAttachShader");
+    GL_LOAD(link,"glLinkProgram"); GL_LOAD(programiv,"glGetProgramiv"); GL_LOAD(programlog,"glGetProgramInfoLog");
+    GL_LOAD(use,"glUseProgram"); GL_LOAD(attrib,"glGetAttribLocation"); GL_LOAD(uniform,"glGetUniformLocation");
+    GL_LOAD(uniformi,"glUniform1i"); GL_LOAD(enableattrib,"glEnableVertexAttribArray");
+    GL_LOAD(attribptr,"glVertexAttribPointer"); GL_LOAD(activetexture,"glActiveTexture");
     GL_LOAD(viewport,"glViewport"); GL_LOAD(clearcolor,"glClearColor"); GL_LOAD(clear,"glClear");
     GL_LOAD(draw,"glDrawArrays"); GL_LOAD(getstring,"glGetString");
     GL_LOAD(disable,"glDisable"); GL_LOAD(readpixels,"glReadPixels");
-    version = (const char *) gl.getstring(0x1F02u);
-    if (!version) return -1;
-    fs = (version[0] != 'O') ? fs120 : fs100;
-    shv = gl.creates(0x8B31u); gl.source(shv,1,&vs,0); gl.compile(shv); gl.shaderiv(shv,0x8B81u,&ok); if (!ok) return -1;
-    shf = gl.creates(0x8B30u); gl.source(shf,1,&fs,0); gl.compile(shf); gl.shaderiv(shf,0x8B81u,&ok); if (!ok) return -1;
-    gl_program = gl.createprog(); gl.attach(gl_program,shv); gl.attach(gl_program,shf); gl.link(gl_program);
-    gl.programiv(gl_program,0x8B82u,&ok); if (!ok) return -1;
+    version = (const char *)gl.getstring(0x1F02u);
+    renderer = (const char *)gl.getstring(0x1F01u); vendor = (const char *)gl.getstring(0x1F00u);
+    if (!version) { gl_log("glGetString(GL_VERSION) ha restituito NULL\n"); return -1; }
+    if (software_gl_renderer(renderer) && !g_gl_explicit) {
+        g_gl_software = 1; gl_log("renderer software rifiutato in auto-select: ");
+        reasm_elf_log(renderer ? renderer : "(null)"); reasm_elf_log(" | vendor: ");
+        reasm_elf_log(vendor ? vendor : "(null)"); reasm_elf_log("\n"); return -1;
+    }
+    shv = gl.creates(0x8B31u); gl.source(shv,1,&vs,0); gl.compile(shv); gl.shaderiv(shv,0x8B81u,&ok);
+    if (!ok) { gl_log("vertex shader compile "); reasm_elf_log(profile); reasm_elf_log(" "); gl_log_info("driver info log",shv,gl.shaderlog); return -1; }
+    shf = gl.creates(0x8B30u); gl.source(shf,1,&fs,0); gl.compile(shf); gl.shaderiv(shf,0x8B81u,&ok);
+    if (!ok) { gl_log("fragment shader compile "); reasm_elf_log(profile); reasm_elf_log(" "); gl_log_info("driver info log",shf,gl.shaderlog); return -1; }
+    gl_program=gl.createprog(); gl.attach(gl_program,shv); gl.attach(gl_program,shf); gl.link(gl_program);
+    gl.programiv(gl_program,0x8B82u,&ok);
+    if (!ok) { gl_log("shader link "); reasm_elf_log(profile); reasm_elf_log(" "); gl_log_info("driver info log",gl_program,gl.programlog); return -1; }
     gl_pos_attr=gl.attrib(gl_program,"a_pos"); gl_uv_attr=gl.attrib(gl_program,"a_uv");
     gl_idx_uniform=gl.uniform(gl_program,"u_idx"); gl_pal_uniform=gl.uniform(gl_program,"u_pal");
     gl.gen(1,&gl_idx_tex); gl.gen(1,&gl_pal_tex);
     gl.bind(0x0DE1u,gl_idx_tex); gl.parami(0x0DE1u,0x2801u,0x2600); gl.parami(0x0DE1u,0x2800u,0x2600);
     gl.parami(0x0DE1u,0x2802u,0x812F); gl.parami(0x0DE1u,0x2803u,0x812F);
-    gl.pixelstore(0x0CF5u,1); gl.teximage(0x0DE1u,0,0x1909,640,480,0,0x1909,0x1401,0);
+    gl.pixelstore(0x0CF5u,1);
+    if (major >= 3 || mask == 1) gl.teximage(0x0DE1u,0,0x8229,640,480,0,0x1903,0x1401,0);
+    else gl.teximage(0x0DE1u,0,0x1909,640,480,0,0x1909,0x1401,0);
     gl.bind(0x0DE1u,gl_pal_tex); gl.parami(0x0DE1u,0x2801u,0x2600); gl.parami(0x0DE1u,0x2800u,0x2600);
     gl.parami(0x0DE1u,0x2802u,0x812F); gl.parami(0x0DE1u,0x2803u,0x812F);
     gl.teximage(0x0DE1u,0,0x1908,256,1,0,0x1908,0x1401,0);
-    gl_ready = 1; g_pal_dirty = 1;
+    gl_ready=1; g_pal_dirty=1;
+    gl_log("profil "); reasm_elf_log(profile); reasm_elf_log(" attivo; versione: ");
+    reasm_elf_log(version); reasm_elf_log(" | renderer: "); reasm_elf_log(renderer ? renderer : "(null)"); reasm_elf_log("\n");
+    return 0;
+}
+static int gl_init(void) {
+    static const char *vs_es="attribute vec2 a_pos; attribute vec2 a_uv; varying vec2 v_uv; void main(){gl_Position=vec4(a_pos,0.0,1.0);v_uv=a_uv;}";
+    static const char *fs_es="precision mediump float; varying vec2 v_uv; uniform sampler2D u_idx; uniform sampler2D u_pal; void main(){float idx=floor(texture2D(u_idx,v_uv).r*255.0+0.5); gl_FragColor=texture2D(u_pal,vec2((idx+0.5)/256.0,0.5));}";
+    static const char *vs_desktop="attribute vec2 a_pos; attribute vec2 a_uv; varying vec2 v_uv; void main(){gl_Position=vec4(a_pos,0.0,1.0);v_uv=a_uv;}";
+    static const char *fs_desktop="varying vec2 v_uv; uniform sampler2D u_idx; uniform sampler2D u_pal; void main(){float idx=floor(texture2D(u_idx,v_uv).r*255.0+0.5); gl_FragColor=texture2D(u_pal,vec2((idx+0.5)/256.0,0.5));}";
+    static const char *vs_core="#version 150\nin vec2 a_pos; in vec2 a_uv; out vec2 v_uv; void main(){gl_Position=vec4(a_pos,0.0,1.0);v_uv=a_uv;}";
+    static const char *fs_core="#version 150\nin vec2 v_uv; out vec4 fragColor; uniform sampler2D u_idx; uniform sampler2D u_pal; void main(){float idx=floor(texture(u_idx,v_uv).r*255.0+0.5); fragColor=texture(u_pal,vec2((idx+0.5)/256.0,0.5));}";
+    if (gl_ready) return 0;
+    memset(&gl,0,sizeof gl); g_gl_software=0;
+    if (gl_context_attempt("GLES 2.0",2,0,SDL_GL_CONTEXT_PROFILE_ES,vs_es,fs_es)==0) goto ready;
+    if (g_gl_context) { SDL_GL_DeleteContext(g_gl_context); g_gl_context=0; }
+    memset(&gl,0,sizeof gl);
+    if (gl_context_attempt("desktop GL 2.1",2,1,0,vs_desktop,fs_desktop)==0) goto ready;
+    if (g_gl_context) { SDL_GL_DeleteContext(g_gl_context); g_gl_context=0; }
+    memset(&gl,0,sizeof gl);
+    if (gl_context_attempt("GLES 3.0",3,0,SDL_GL_CONTEXT_PROFILE_ES,vs_es,fs_es)==0) goto ready;
+    if (g_gl_context) { SDL_GL_DeleteContext(g_gl_context); g_gl_context=0; }
+    memset(&gl,0,sizeof gl);
+    if (gl_context_attempt("desktop GL 3.2 core",3,2,1,vs_core,fs_core)==0) goto ready;
+    if (g_gl_context) { SDL_GL_DeleteContext(g_gl_context); g_gl_context=0; }
+    memset(&gl,0,sizeof gl); g_gl_profile="none";
+    gl_log("tutti i profili falliti; abbandono GL\n"); return -1;
+ready:
     reasm_elf_log("[host] present: OpenGL/GLES2 palette shader (8bpp upload)\n");
     return 0;
 }
@@ -850,16 +943,16 @@ static int present_gl(void) {
     gl.attribptr((GLu)gl_uv_attr,2,0x1406,0,4*sizeof(float),quad+2);
     gl.draw(0x0005u,0,4);
     if (getenv("SC_GL_VERIFY") && vp.w == 640 && vp.h == 480) {
-        static unsigned char *pixels; static int verified;
-        unsigned int y,x,errors=0;
+        static unsigned char *pixels; static int verified, mismatch_logged;
+        unsigned int y,x,errors=0, first_x=0, first_y=0;
         if (!pixels) pixels=(unsigned char *)malloc(640u*480u*4u);
         if (!pixels) return -1;
         gl.pixelstore(0x0D05u,1); gl.readpixels(0,0,640,480,0x1908u,0x1401u,pixels);
         for(y=0;y<480;++y) for(x=0;x<640;++x) {
             unsigned int c=g_pal[g_canvas[(unsigned long)(479-y)*g_pitch+x]], p=(y*640u+x)*4u;
-            if(pixels[p]!=(unsigned char)(c>>16) || pixels[p+1]!=(unsigned char)(c>>8) || pixels[p+2]!=(unsigned char)c || pixels[p+3]!=255) ++errors;
+            if(pixels[p]!=(unsigned char)(c>>16) || pixels[p+1]!=(unsigned char)(c>>8) || pixels[p+2]!=(unsigned char)c || pixels[p+3]!=255) { if (!errors) { first_x=x; first_y=y; } ++errors; }
         }
-        if(errors) { reasm_elf_log("[host] SC_GL_VERIFY mismatch\n"); return -1; }
+        if(errors) { if (!mismatch_logged) { char b[160]; snprintf(b,sizeof b,"[host] GL SC_GL_VERIFY mismatch: %u pixel, primo (%u,%u)\n",errors,first_x,first_y); reasm_elf_log(b); mismatch_logged=1; } return -1; }
         if(!verified) { reasm_elf_log("[host] SC_GL_VERIFY PASS: 307200 pixel esatti\n"); verified=1; }
     }
     SDL_GL_SwapWindow(g_win);
@@ -893,7 +986,8 @@ static int present_gpu(SDL_Surface *ws) {
     (void) ws;
     if (!g_win) return -1;
     if (!rend) {
-        rend = SDL_CreateRenderer(g_win, -1, 0x2u /*ACCELERATED*/);
+        if (!g_gl_software) rend = SDL_CreateRenderer(g_win, -1, 0x2u /*ACCELERATED*/);
+        if (!rend) rend = SDL_CreateRenderer(g_win, -1, 0x1u /*SOFTWARE*/);
         if (!rend) rend = SDL_CreateRenderer(g_win, -1, 0);
         if (!rend) return -1;
         tex = SDL_CreateTexture(rend, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, 640, 480);
@@ -982,22 +1076,98 @@ static int present_scaled(SDL_Surface *ws) {
     return 0;
 }
 
+static unsigned int present_fps_cap(void) {
+    const char *s = getenv("SC_FPS_CAP");
+    unsigned int n = 0;
+    if (!s || !*s) return 0;
+    while (*s >= '0' && *s <= '9') {
+        unsigned int d = (unsigned int)(*s++ - '0');
+        if (n > 100000u) return 1000u;
+        n = n * 10u + d;
+    }
+    return *s ? 0 : (n > 1000u ? 1000u : n);
+}
+static int bytes_equal(const unsigned char *a, const unsigned char *b, unsigned long n) {
+    return memcmp(a, b, n) == 0;
+}
+static int present_is_duplicate(unsigned int now) {
+    const char *dedup = getenv("SC_DEDUP_PRESENT");
+    unsigned long size = (unsigned long)g_pitch * (unsigned long)g_h;
+    if ((dedup && dedup[0] == '0') || getenv("SC_GL_VERIFY") || g_present_force ||
+        g_pal_dirty || !g_present_snapshot_valid || now - g_presented_at >= 250u ||
+        size != g_present_snapshot_size) return 0;
+    if (!g_present_snapshot) {
+        g_present_snapshot = (unsigned char *)malloc(size);
+        if (!g_present_snapshot) return 0;
+        g_present_snapshot_valid = 0;
+        return 0;
+    }
+    return now - g_presented_at < 16u &&
+           bytes_equal(g_canvas, g_present_snapshot, size) &&
+           bytes_equal((const unsigned char *)g_pal,
+                       (const unsigned char *)g_present_palette, sizeof g_pal);
+}
+static void present_snapshot_commit(unsigned int now) {
+    unsigned long size = (unsigned long)g_pitch * (unsigned long)g_h;
+    if (!g_present_snapshot && size == g_present_snapshot_size)
+        g_present_snapshot = (unsigned char *)malloc(size);
+    if (g_present_snapshot && size == g_present_snapshot_size) {
+        memcpy(g_present_snapshot, g_canvas, size);
+        memcpy(g_present_palette, g_pal, sizeof g_pal);
+        g_present_snapshot_valid = 1;
+    }
+    g_presented_at = now;
+    g_pal_dirty = 0;
+    g_present_force = 0;
+}
+
 void host_elf_present(void) {
     SDL_Surface *ws;
+    unsigned int now, cap;
     if (!g_win || !g_canvas) return;
-    /* Pump dell'input UNA volta per present (mai WndProc dentro un compositore). */
+    /* Input/pump resta sempre non-throttled anche quando si deduplica o si limita il present. */
     if (host_elf_input_owner() && win32_input_pump) win32_input_pump();
+    now = SDL_GetTicks();
+    if (present_is_duplicate(now)) return;
+    cap = present_fps_cap();
+    if (cap && g_present_snapshot_valid && now - g_presented_at < 1000u / cap) {
+        /* Pacing reale: il gioco chiama present in un loop stretto (spins) finche' il frame non e' dovuto.
+         * Dormire il tempo residuo invece di bruciare CPU replica il blocco del Blt con vsync originale;
+         * l'input continua a essere consegnato durante l'attesa (sleep a fette di 2 ms).
+         * SC_FPS_SLEEP=0 disabilita il pacing (comportamento busy-wait precedente). */
+        static int sleep_en;
+        static int sleep_init;
+        if (!sleep_init) { const char *sv = getenv("SC_FPS_SLEEP"); sleep_en = !(sv && sv[0] == '0'); sleep_init = 1; }
+        if (sleep_en) {
+            static unsigned int max_sleep;
+            static int max_init;
+            unsigned int budget = 1000u / cap, wait = budget - (now - g_presented_at);
+            if (!max_init) {
+                const char *mv = getenv("SC_FPS_SLEEP_MAX");
+                long lv = mv && *mv ? atol(mv) : 4;
+                if (lv < 0) lv = 0;
+                if (lv > 20) lv = 20;
+                max_sleep = (unsigned int) lv; max_init = 1;
+            }
+            if (wait > max_sleep) wait = max_sleep;
+            if (wait) SDL_Delay(wait);
+            now = SDL_GetTicks();
+            if (now - g_presented_at < 1000u / cap) return;
+        } else {
+            return;
+        }
+    }
     {   /* gl -> gpu -> cpu; gpu/cpu permettono A/B esplicito. */
         const char *mode = getenv("SC_PRESENT");
         static int gpu_ok = 1;
         int want_gl = g_gl_requested && !g_gl_failed && !(mode && mode[0] == 'g' && mode[1] == 'p') && !(mode && mode[0] == 'c');
         int want_gpu = !(mode && mode[0] == 'c');
         if (want_gl) {
-            if (present_gl() == 0) return;
+            if (present_gl() == 0) { present_snapshot_commit(SDL_GetTicks()); return; }
             gl_fallback_window();
         }
         if (want_gpu && gpu_ok) {
-            if (present_gpu(0) == 0) return;
+            if (present_gpu(0) == 0) { present_snapshot_commit(SDL_GetTicks()); return; }
             gpu_ok = 0;
             reasm_elf_log("[host] present: GPU non disponibile, uso la scalatura CPU\n");
         }
@@ -1006,6 +1176,7 @@ void host_elf_present(void) {
     if (!ws || !ws->pixels || !ws->format) return;
     if (present_scaled(ws) != 0) return;
     if (SDL_UpdateWindowSurface(g_win) != 0) log_drv("present: SDL_UpdateWindowSurface");
+    present_snapshot_commit(SDL_GetTicks());
 }
 
 int host_elf_read_pixel(int x, int y, unsigned char rgb[3]) {
@@ -1088,6 +1259,7 @@ extern long read(int, void *, unsigned long);
 extern int close(int);
 extern long lseek(int, long, int);
 extern int sscanf(const char *, const char *, ...);
+extern long atol(const char *);
 extern int atoi(const char *);
 extern int strncmp(const char *, const char *, unsigned long);
 #define O_RDONLY 0
@@ -1246,10 +1418,21 @@ static void input_test_tick(void) {
          * Commands (one per line): focus | move X Y | down X Y [btn] | up X Y [btn] |
          * click X Y [btn] | keydown K | keyup K | key K | text STR */
         const char *cpath = getenv("SC_CONTROL_FILE");
-        static long ctrl_off = 0;
+        static long ctrl_off = 0;       /* ultimo byte consumato in una riga completa */
+        static long ctrl_read_off = 0;  /* ultimo byte prelevato dal kernel */
+        static int ctrl_fd = -1;
         static int ctrl_pending = 0; /* 1=mouse up, 2=key up */
         static unsigned int ctrl_due_ms = 0;
+        static unsigned int ctrl_retry_ms = 0;
+        static unsigned int ctrl_identity_check_ms = 0;
+        static int ctrl_retry_armed = 0;
+        static int ctrl_identity_check_armed = 0;
         static int ctrl_px = 0, ctrl_py = 0, ctrl_pk = 1;
+        static struct stat ctrl_identity;
+        static char ctrl_buf[512];
+        static unsigned int ctrl_buf_pos = 0, ctrl_buf_len = 0;
+        static char cline[256];
+        static int ci = 0;
         unsigned int now = SDL_GetTicks();
         if (ctrl_pending && now >= ctrl_due_ms) {
             struct host_input_event ce; memset(&ce, 0, sizeof ce);
@@ -1262,55 +1445,105 @@ static void input_test_tick(void) {
             ctrl_pending = 0;
         }
         if (cpath && *cpath && !ctrl_pending) {
-            int cfd = open(cpath, O_RDONLY);
-            if (cfd >= 0) {
-                if (ctrl_off > 0) lseek(cfd, ctrl_off, SEEK_SET);
-                char cline[256]; int ci = 0; long r;
-                while (!ctrl_pending) {
-                    long line_start = ctrl_off;
-                    ci = 0;
-                    for (;;) {
-                        char ch = 0;
-                        r = read(cfd, &ch, 1);
-                        if (r <= 0) { ci = -1; break; }
-                        if (ch == '\n') { cline[ci] = 0; ctrl_off = line_start + ci + 1; break; }
-                        if (ci < (int)sizeof(cline) - 1) cline[ci++] = ch;
-                    }
-                    if (ci < 0) break;
-                    if (ci == 0 || cline[0] == '#') continue;
-                    {
-                        struct host_input_event ce; int a = 0, b = 0, c = 1;
-                        memset(&ce, 0, sizeof ce);
-                        if (!strcmp(cline, "focus")) {
-                            ce.type = HOST_INPUT_FOCUS; ce.key = 1; host_elf_test_event(&ce);
-                        } else if (sscanf(cline, "move %d %d", &a, &b) == 2) {
-                            ce.type = HOST_INPUT_MOVE; ce.x = a; ce.y = b; host_elf_test_event(&ce);
-                        } else if (sscanf(cline, "down %d %d %d", &a, &b, &c) >= 2) {
-                            ce.type = HOST_INPUT_MOVE; ce.x = a; ce.y = b; host_elf_test_event(&ce);
-                            memset(&ce, 0, sizeof ce);
-                            ce.type = HOST_INPUT_DOWN; ce.x = a; ce.y = b; ce.key = c ? c : 1; host_elf_test_event(&ce);
-                        } else if (sscanf(cline, "up %d %d %d", &a, &b, &c) >= 2) {
-                            ce.type = HOST_INPUT_MOVE; ce.x = a; ce.y = b; host_elf_test_event(&ce);
-                            memset(&ce, 0, sizeof ce);
-                            ce.type = HOST_INPUT_UP; ce.x = a; ce.y = b; ce.key = c ? c : 1; host_elf_test_event(&ce);
-                        } else if (sscanf(cline, "click %d %d %d", &a, &b, &c) >= 2) {
-                            ce.type = HOST_INPUT_MOVE; ce.x = a; ce.y = b; host_elf_test_event(&ce);
-                            memset(&ce, 0, sizeof ce);
-                            ce.type = HOST_INPUT_DOWN; ce.x = a; ce.y = b; ce.key = c ? c : 1; host_elf_test_event(&ce);
-                            ctrl_pending = 1; ctrl_px = a; ctrl_py = b; ctrl_pk = c ? c : 1; ctrl_due_ms = SDL_GetTicks() + 120;
-                        } else if (sscanf(cline, "keydown %d", &a) == 1) {
-                            ce.type = HOST_INPUT_KEYDOWN; ce.key = a; host_elf_test_event(&ce);
-                        } else if (sscanf(cline, "keyup %d", &a) == 1) {
-                            ce.type = HOST_INPUT_KEYUP; ce.key = a; host_elf_test_event(&ce);
-                        } else if (sscanf(cline, "key %d", &a) == 1) {
-                            ce.type = HOST_INPUT_KEYDOWN; ce.key = a; host_elf_test_event(&ce);
-                            ctrl_pending = 2; ctrl_pk = a; ctrl_due_ms = SDL_GetTicks() + 100;
-                        } else if (!strncmp(cline, "text ", 5)) {
-                            host_elf_test_text(cline + 5);
+            struct stat path_st, fd_st;
+            long ctrl_file_size = -1;
+            int reset = 0;
+            if (ctrl_fd >= 0) {
+                int path_changed = 0;
+                if (!ctrl_identity_check_armed || (unsigned int)(now - ctrl_identity_check_ms) < 0x80000000u) {
+                    path_changed = stat(cpath, &path_st) != 0 ||
+                                   path_st.st_dev != ctrl_identity.st_dev || path_st.st_ino != ctrl_identity.st_ino;
+                    ctrl_identity_check_ms = now + 250u;
+                    ctrl_identity_check_armed = 1;
+                }
+                if (path_changed || fstat(ctrl_fd, &fd_st) != 0) {
+                    close(ctrl_fd); ctrl_fd = -1; reset = 1;
+                } else {
+                    ctrl_file_size = (long)fd_st.st_size;
+                    if (fd_st.st_size < ctrl_off || fd_st.st_size < ctrl_read_off) {
+                        /* Troncamento: scarta anche eventuali byte prefetched e la riga parziale. */
+                        reset = 1;
+                        if (lseek(ctrl_fd, 0, SEEK_SET) != 0) {
+                            close(ctrl_fd); ctrl_fd = -1;
                         }
                     }
                 }
-                close(cfd);
+            } else if (!ctrl_retry_armed || (unsigned int)(now - ctrl_retry_ms) < 0x80000000u) {
+                if (stat(cpath, &path_st) == 0) ctrl_fd = open(cpath, O_RDONLY);
+                if (ctrl_fd >= 0 && fstat(ctrl_fd, &fd_st) == 0) {
+                    ctrl_identity = fd_st;
+                    ctrl_file_size = (long)fd_st.st_size;
+                    ctrl_identity_check_ms = now + 250u;
+                    ctrl_identity_check_armed = 1;
+                    ctrl_retry_armed = 0;
+                    reset = 1;
+                } else {
+                    if (ctrl_fd >= 0) close(ctrl_fd);
+                    ctrl_fd = -1;
+                    ctrl_retry_ms = now + 250u;
+                    ctrl_retry_armed = 1;
+                }
+            }
+            if (reset) {
+                ctrl_off = ctrl_read_off = 0;
+                ctrl_buf_pos = ctrl_buf_len = 0;
+                ci = 0;
+            }
+            if (ctrl_fd >= 0) {
+                while (!ctrl_pending) {
+                    if (ctrl_buf_pos >= ctrl_buf_len) {
+                        long r;
+                        if (ctrl_file_size <= ctrl_read_off) break;
+                        r = read(ctrl_fd, ctrl_buf, sizeof ctrl_buf);
+                        if (r <= 0) break; /* EOF/no byte nuovo: nessun polling interno */
+                        ctrl_buf_pos = 0;
+                        ctrl_buf_len = (unsigned int)r;
+                        ctrl_read_off += r;
+                    }
+                    {
+                        char ch = ctrl_buf[ctrl_buf_pos++];
+                        if (ch != '\n') {
+                            if (ci < (int)sizeof cline - 1) cline[ci++] = ch;
+                            /* il parser storico conservava i primi 255 byte */
+                            continue;
+                        }
+                        cline[ci] = 0;
+                        ctrl_off = ctrl_read_off - (long)ctrl_buf_len + (long)ctrl_buf_pos;
+                        ci = 0;
+                        if (!cline[0] || cline[0] == '#') continue;
+                        {
+                            struct host_input_event ce; int a = 0, b = 0, c = 1;
+                            memset(&ce, 0, sizeof ce);
+                            if (!strcmp(cline, "focus")) {
+                                ce.type = HOST_INPUT_FOCUS; ce.key = 1; host_elf_test_event(&ce);
+                            } else if (sscanf(cline, "move %d %d", &a, &b) == 2) {
+                                ce.type = HOST_INPUT_MOVE; ce.x = a; ce.y = b; host_elf_test_event(&ce);
+                            } else if (sscanf(cline, "down %d %d %d", &a, &b, &c) >= 2) {
+                                ce.type = HOST_INPUT_MOVE; ce.x = a; ce.y = b; host_elf_test_event(&ce);
+                                memset(&ce, 0, sizeof ce);
+                                ce.type = HOST_INPUT_DOWN; ce.x = a; ce.y = b; ce.key = c ? c : 1; host_elf_test_event(&ce);
+                            } else if (sscanf(cline, "up %d %d %d", &a, &b, &c) >= 2) {
+                                ce.type = HOST_INPUT_MOVE; ce.x = a; ce.y = b; host_elf_test_event(&ce);
+                                memset(&ce, 0, sizeof ce);
+                                ce.type = HOST_INPUT_UP; ce.x = a; ce.y = b; ce.key = c ? c : 1; host_elf_test_event(&ce);
+                            } else if (sscanf(cline, "click %d %d %d", &a, &b, &c) >= 2) {
+                                ce.type = HOST_INPUT_MOVE; ce.x = a; ce.y = b; host_elf_test_event(&ce);
+                                memset(&ce, 0, sizeof ce);
+                                ce.type = HOST_INPUT_DOWN; ce.x = a; ce.y = b; ce.key = c ? c : 1; host_elf_test_event(&ce);
+                                ctrl_pending = 1; ctrl_px = a; ctrl_py = b; ctrl_pk = c ? c : 1; ctrl_due_ms = SDL_GetTicks() + 120;
+                            } else if (sscanf(cline, "keydown %d", &a) == 1) {
+                                ce.type = HOST_INPUT_KEYDOWN; ce.key = a; host_elf_test_event(&ce);
+                            } else if (sscanf(cline, "keyup %d", &a) == 1) {
+                                ce.type = HOST_INPUT_KEYUP; ce.key = a; host_elf_test_event(&ce);
+                            } else if (sscanf(cline, "key %d", &a) == 1) {
+                                ce.type = HOST_INPUT_KEYDOWN; ce.key = a; host_elf_test_event(&ce);
+                                ctrl_pending = 2; ctrl_pk = a; ctrl_due_ms = SDL_GetTicks() + 100;
+                            } else if (!strncmp(cline, "text ", 5)) {
+                                host_elf_test_text(cline + 5);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1483,9 +1716,33 @@ static void test_hooks_tick(void) {
     }
 }
 
+/* Cadenza massima del pump di input: il gioco chiama la pump centinaia di volte per frame e ogni
+ * SDL_PollEvent senza eventi costa una recvmsg() sul socket X/Wayland (EAGAIN). Un tetto a ~500 Hz
+ * (2 ms) riduce di ~35x le syscall senza cambiare il comportamento osservabile: gli eventi restano
+ * accodati da SDL e vengono consegnati al giro successivo. SC_PUMP_HZ=0 disattiva il tetto. */
+static unsigned int pump_hz_cap(void) {
+    static unsigned int hz = 0xFFFFFFFFu;
+    if (hz == 0xFFFFFFFFu) {
+        const char *s = getenv("SC_PUMP_HZ");
+        long v = s && *s ? atol(s) : 500;
+        if (v < 0) v = 0;
+        if (v > 20000) v = 20000;
+        hz = (unsigned int) v;
+    }
+    return hz;
+}
+
 int host_elf_pump(void) {
     SDL_EventBuf e;
+    unsigned int hz;
+    static unsigned int last_ms;
+    static int have_last;
+    unsigned int now_ms;
     if(!host_elf_input_owner()) return g_quit;
+    hz = pump_hz_cap();
+    now_ms = SDL_GetTicks();
+    if (hz && have_last && (now_ms - last_ms) * hz < 1000u) return g_quit;
+    last_ms = now_ms; have_last = 1;
     mouse_poll_global();
     test_hooks_tick();
     input_test_tick();
@@ -1506,7 +1763,7 @@ int host_elf_pump(void) {
             else if(w==12 || w==13) {
                 in.type=HOST_INPUT_FOCUS; in.key=(w==12);
                 if(w==13) { memset(g_keys,0,sizeof g_keys); g_mods=g_polled_mods=0; g_mouse_btn=g_polled_buttons=0; }
-            } else if(w==3) in.type=HOST_INPUT_EXPOSE;
+            } else if(w==3) { in.type=HOST_INPUT_EXPOSE; g_present_force=1; }
             else enqueue=0;
         } else if(t==SDL_MOUSEMOTION || t==SDL_MOUSEBUTTONDOWN || t==SDL_MOUSEBUTTONUP) {
             int b=EV_BUTTON(&e);
