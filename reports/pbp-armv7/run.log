@@ -1,0 +1,17 @@
+[arm-game] runtime ARMv6 — immagini tradotte, import statici
+[arm-game] byte PE ai VA originali: 11 regioni
+[arm-game] header PE exe a 0x00400000
+[arm-game] header PE storm a 0x15000000
+[arm-game] cpu=0x0E000000
+[arm-game] TEB=0x0E000098
+[arm-game] PEB=0x0E001098
+[arm-game] bridge: 341 import, 9 UNK dichiarati
+[arm-game] entry: start() del CRT a 0x00404C21
+[arm-game] DllMain di storm (DLL_PROCESS_ATTACH, hinst=0x15000000)
+[risorse] eseguibile: .rsrc RVA=0x002DE000 VA=0x006DE000
+[arm-cpu] SIGSEGV
+[arm-cpu] fault pc 0x18A22B78  lr 0x18A20468
+[arm-cpu] procedura tradotta: entry VA 0x15030AB0  offset nel proc 0x00003164
+[arm-cpu] fault address 0x1505FC20
+[arm-cpu] catena sullo stack del guest (indirizzi di codice):
+[arm-cpu] guest eip 0x00000000  esp 0x021FFEAC  eax 0x00000000  edx 0x18D72CD8
