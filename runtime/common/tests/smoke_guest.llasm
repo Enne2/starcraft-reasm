@@ -1,0 +1,110 @@
+; runtime/arm/tests/smoke_guest.llasm — guest code compiled by llasm for the ARMv6 runtime test.
+;
+; It exercises exactly the seams the runtime owns:
+;   * 64/32-bit division helpers        (x86_div_64, x86_idiv_32)   -> llasm_divide.c
+;   * x87 software FPU                  (fld_double, fmul_double, fstp_double) -> llasm_float.c
+;   * string ops                        (rep movsd, repe cmpsb)     -> llasm_movs.c / llasm_cmps.c
+;   * fs:[0x34] (LastError)             (x86_read/write_fs_dword)   -> emulated TEB, no %fs
+;   * an imported function with stdcall semantics (armtest_probe)  -> bridge_arm.c + stubs
+;
+; Results are written to fixed guest addresses (0x00401000..) that the C harness inspects.
+; Guest memory is mapped at the original image VAs, so absolute immediates are guest VAs.
+
+include llasm.llinc
+
+; ---- imports under test (declared exactly as SRW emits them: `proc <name> external`) ----
+proc armtest_probe external      ; 1 stdcall argument, result = arg*2+1
+proc GetLastError external       ; 0 arguments, result = fs:[0x34]
+
+proc smoke_guest global c_smoke_guest
+
+; ---- 1) DIV_64: dividend 0x1:0x0 (2^32), divisor 7 ----
+mov eax, 0
+mov edx, 1
+DIV_64 7
+mov tmp1, 0x401000
+store eax, tmp1, 4
+add tmp1, tmp1, 4
+store edx, tmp1, 4
+
+; ---- 2) IDIV_32: dx:ax = 0:0x64 (100), divisor 7 ----
+mov eax, 0x64
+mov edx, 0
+IDIV_32 7
+mov tmp1, 0x401008
+store eax, tmp1, 4
+add tmp1, tmp1, 4
+store edx, tmp1, 4
+
+; ---- 3) x87: 1.5 * 2.0, stored as a double ----
+mov tmp1, 0x401030
+load tmp2, tmp1, 4
+add tmp1, tmp1, 4
+load tmp3, tmp1, 4
+call x87_fld_double $, tmp2, tmp3
+mov tmp1, 0x401038
+load tmp2, tmp1, 4
+add tmp1, tmp1, 4
+load tmp3, tmp1, 4
+call x87_fmul_double $, tmp2, tmp3
+call x87_fstp_double $
+load tmp1, tmp0, 4
+add tmp0, tmp0, 4
+load tmp2, tmp0, 4
+mov tmp3, 0x401010
+store tmp1, tmp3, 4
+add tmp3, tmp3, 4
+store tmp2, tmp3, 4
+
+; ---- 4) rep movsd: copy 16 bytes 0x401100 -> 0x401110 ----
+mov esi, 0x401100
+mov edi, 0x401110
+mov ecx, 4
+REP_MOVSD
+
+; ---- 5) repe cmpsb over two equal 8-byte blocks -> ecx = 0 ----
+mov esi, 0x401100
+mov edi, 0x401110
+mov ecx, 8
+REPE_CMPSB
+mov tmp1, 0x401018
+store ecx, tmp1, 4
+
+; ---- 6) fs:[0x34]: write then read back (emulated TEB, no %fs on ARM) ----
+call x86_write_fs_dword 0x34, 0x1234
+call x86_read_fs_dword 0x34
+mov tmp1, 0x40101C
+store tmp0, tmp1, 4
+
+; ---- 7) import call with one stdcall argument ----
+PUSH 21
+PUSH smoke_after_import
+mov eax, armtest_probe
+tcall eax
+endp
+
+proc smoke_after_import
+mov tmp1, 0x401020
+store eax, tmp1, 4
+
+; ---- 8) imported GetLastError must see the value written through fs:[0x34] ----
+PUSH smoke_after_gle
+mov eax, GetLastError
+tcall eax
+endp
+
+proc smoke_after_gle
+mov tmp1, 0x401024
+store eax, tmp1, 4
+
+; ---- 9) return from the wrapped entry: pops __return_procedure (installed by the wrapper) ----
+POP tmp1
+tcall tmp1
+endp
+
+; ---- 10) bare routine, no ccc wrapper: its return address is the runtime sentinel ----
+proc raw_guest public
+mov eax, 0x5a5a5a5a
+POP tmp1
+tcall tmp1
+endp

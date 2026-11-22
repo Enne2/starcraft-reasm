@@ -1,0 +1,139 @@
+--- a/tools/elf/win32_shim.c
++++ b/tools/elf/win32_shim.c
+@@ -15,6 +15,9 @@
+  * dava precedenza a questi stub e il gioco mostrava "File error creating new character"
+  * (CreateDirectoryA non impostava ERROR_ALREADY_EXISTS=183 su un path esistente). */
+ #include "win32_game.h"
++#if defined(__arm__)
++#include "x86_helpers.h"   /* ARM port: emulated TEB (x86_read/write_fs_dword) */
++#endif
+ 
+ #define S __attribute__((stdcall))
+ 
+@@ -76,15 +79,30 @@
+ /* --- risoluzione CASE-INSENSITIVE dei path (Windows lo e') ---
+  * Il gioco apre "Stardat.mpq" mentre su disco il file e' "StarDat.mpq": su Windows non importa,
+  * su Linux si'. Si risolve componente per componente con getdents64 e si apre il nome REALE. */
+-#define UI_O_DIRECTORY 0x10000
+ struct ui_dirent64 { unsigned long long d_ino; long long d_off; unsigned short d_reclen;
+                      unsigned char d_type; char d_name[]; };
+ 
++#if defined(__arm__)
++/* ARM port: an i386 `int $0x80` gate does not exist here. glibc provides the getdents64
++ * wrapper, and O_DIRECTORY must come from <fcntl.h>: it is 0x4000 on 32-bit ARM, while the
++ * literal below (0x10000) is the x86_64 value. Source of truth: the C library of the sysroot. */
++#include <fcntl.h>
++#include <sys/vfs.h>
++#define UI_O_DIRECTORY O_DIRECTORY
++/* getdents64 is a raw kernel-structure reader: declared here instead of relying on the
++ * feature-test macros of <dirent.h> (the shim does not define _GNU_SOURCE). */
++extern int getdents64(int fd, void *buffer, unsigned long count);
++static int getdents64_(int fd, void *buf, unsigned int n) {
++    return getdents64(fd, buf, (unsigned long) n);
++}
++#else
++#define UI_O_DIRECTORY 0x10000
+ static int getdents64_(int fd, void *buf, unsigned int n) {
+     int ret;
+     __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(220), "b"(fd), "c"(buf), "d"(n) : "memory");
+     return ret;
+ }
++#endif
+ static int ci_lookup(const char *dir, const char *want, char *out, int n) {
+     int fd = open(dir, 0 | UI_O_DIRECTORY);
+     char buf[2048];
+@@ -168,11 +186,35 @@
+ /* --- letture dal SISTEMA REALE (il gioco controlla risorse all'avvio) --- */
+ struct ui_statfs { long type, bsize, blocks, bfree, bavail, files, ffree; long fsid[2];
+                    long namelen, frsize, flags, spare[4]; };
++#if defined(__arm__)
++/* ARM port: glibc statfs() instead of i386 syscall 99. The shim only reads numbers out of the
++ * structure, and glibc's layout differs (f_type is 32-bit), so the fields are copied one by one
++ * into the caller's ui_statfs instead of aliasing memory. */
++static int statfs_(const char *path, struct ui_statfs *b) {
++    struct statfs s;
++    if (statfs(path, &s) != 0) return -1;
++    b->type = (long) s.f_type;
++    b->bsize = (long) s.f_bsize;
++    b->blocks = (long) s.f_blocks;
++    b->bfree = (long) s.f_bfree;
++    b->bavail = (long) s.f_bavail;
++    b->files = (long) s.f_files;
++    b->ffree = (long) s.f_ffree;
++    b->fsid[0] = (long) s.f_fsid.__val[0];
++    b->fsid[1] = (long) s.f_fsid.__val[1];
++    b->namelen = (long) s.f_namelen;
++    b->frsize = (long) s.f_frsize;
++    b->flags = (long) s.f_flags;
++    b->spare[0] = b->spare[1] = b->spare[2] = b->spare[3] = 0;
++    return 0;
++}
++#else
+ static int statfs_(const char *path, struct ui_statfs *b) {
+     int ret;
+     __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(99), "b"(path), "c"(b) : "memory");
+     return ret;
+ }
++#endif
+ /* conta i processori logici in /proc/cpuinfo (righe "processor") */
+ static u32 cpu_count_(void) {
+     char buf[4096];
+@@ -923,12 +965,22 @@
+ /* --- errori / TLS --- */
+ static unsigned int g_err26_gets, g_err26_sets;
+ S u32 GetLastError(void) {
++#if defined(__arm__)
++    /* ARM port: there is no %fs. The emulated TEB lives in guest memory and is reached through
++     * the same two functions the LLASM fs helper uses (runtime/arm/x86_helpers.c). */
++    u32 v = X86_ReadFsDword(0x34);
++#else
+     u32 v; __asm__ volatile ("movl %%fs:0x34, %0" : "=r"(v));
++#endif
+     if (g_trace && v == 0x26 && __sync_fetch_and_add(&g_err26_gets, 1) < 16) reasm_trace2("[err26] GetLastError caller=", (u32)(ulong)__builtin_return_address(0), " value=", v);
+     return v;
+ }
+ S void SetLastError(u32 e) {
++#if defined(__arm__)
++    X86_WriteFsDword(0x34, (uint32_t) e);
++#else
+     __asm__ volatile ("movl %0, %%fs:0x34" :: "r"(e));
++#endif
+     if (g_trace && e == 0x26 && __sync_fetch_and_add(&g_err26_sets, 1) < 16) reasm_trace2("[err26] SetLastError caller=", (u32)(ulong)__builtin_return_address(0), " value=", e);
+ }
+ S u32  TlsAlloc(void) { return (u32) g_tls_n++; }
+--- a/tools/elf/win32_game.h
++++ b/tools/elf/win32_game.h
+@@ -1,10 +1,17 @@
+ /* T4: additive APIs only; Windows scalar types are always 32 bit here. */
+ #ifndef SC_WIN32_GAME_H
+ #define SC_WIN32_GAME_H
+-#if !defined(__i386__)
+-#error win32_game requires the ELF32 i386 runtime
++#if !defined(__i386__) && !defined(__arm__)
++#error win32_game requires the ELF32 i386 runtime (or the ARMv6 runtime)
+ #endif
++#if defined(__i386__)
+ #define GAME_STDCALL __attribute__((stdcall))
++#else
++/* ARMv6 port: AAPCS has no stdcall. The guest stack discipline is the import bridge's job
++ * (runtime/arm/bridge_arm.c), never the host calling convention, so the attribute must vanish
++ * rather than be silently ignored. */
++#define GAME_STDCALL
++#endif
+ typedef unsigned int game_u32;
+ typedef struct { int left, top, right, bottom; } GameRect;
+ /* Exact T3 weak-table ABI; the provider definition is strong. */
+--- a/tools/elf/main_elf.c
++++ b/tools/elf/main_elf.c
+@@ -113,7 +113,11 @@
+ static void crash_handler(int sig) {
+     unsigned long *sp;
+     int i, shown = 0;
++#if defined(__arm__)
++    sp = (unsigned long *) &sp;   /* ARM port: address of a local = current stack pointer */
++#else
+     __asm__ volatile ("movl %%esp, %0" : "=r"(sp));
++#endif
+     reasm_elf_log("[reasm-elf] SEGNALE ");
+     putdec((unsigned) sig);
+     reasm_elf_log(": indirizzi di codice sullo stack:\n");

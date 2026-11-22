@@ -1,0 +1,40 @@
+/* runtime/arm/bridge_unk.def — import NON implementati, dichiarati come trampolini rumorosi.
+ *
+ * Ogni riga UNK(<simbolo>) genera uno stub con l'ABI del guest il cui unico effetto e' stampare il
+ * nome e l'indirizzo di ritorno e uscire con 3 (regola D19: mai uno stub che ritorna al posto di
+ * un'API con arita' incerta). Sono la worklist del port, e compaiono anche nel riepilogo d'avvio
+ * (`arm_bridge_unk_count`): un simbolo qui non e' "fatto", e' "dichiarato".
+ *
+ * Criterio: qui finisce solo cio' che non ha ne' uno shim C con prototipo (il generatore ne
+ * ricava l'arita') ne' un'implementazione fedele possibile nel modello ARM. Le API che possono
+ * essere implementate davvero stanno in runtime/arm/win32_ext_arm.c.
+ */
+
+/* __fpmath NON e' qui: e' definito come simbolo assoluto 0 in guest_abs_zero.S, cosi' la CRT
+ * tradotta prende il proprio ramo x87 invece del dispatcher di msvcrt.dll (che non abbiamo). */
+
+/* Etichette interne del CRT di storm riferite solo da una tabella di puntatori (vedi
+ * run-*/extern.llinc): l'indirizzo deve esistere, il codice non deve essere invocato. */
+UNK(crt_unlifted_1504048B)
+UNK(crt_unlifted_15040DF3)
+UNK(crt_unlifted_15040DF7)
+UNK(crt_unlifted_15040E07)
+UNK(crt_unlifted_15041A41)
+UNK(crt_unlifted_15041B81)
+UNK(crt_unlifted_15041D4D)
+UNK(crt_unlifted_15041D52)
+UNK(crt_unlifted_15043005)
+UNK(crt_unlifted_15043058)
+UNK(crt_unlifted_150430B9)
+UNK(crt_unlifted_150430E4)
+UNK(crt_unlifted_1504311F)
+UNK(crt_unlifted_15043177)
+UNK(crt_unlifted_15043197)
+UNK(crt_unlifted_150431CF)
+UNK(crt_unlifted_15043224)
+UNK(crt_unlifted_15043241)
+UNK(crt_unlifted_15043271)
+UNK(crt_unlifted_15043289)
+UNK(crt_unlifted_1504339F)
+
+/* Le API Win32 implementate nello shim ELF restano escluse dal fallback UNK. */

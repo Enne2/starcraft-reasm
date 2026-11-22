@@ -1,0 +1,46 @@
+/* runtime/arm/bridge_dynamic.def — import risolti a RUNTIME (LoadLibrary + GetProcAddress).
+ *
+ * Queste API non compaiono come riferimento statico negli oggetti tradotti (il gioco le risolve
+ * con GetProcAddress), quindi non entrano nell'elenco "need" e non avrebbero uno stub. Ma la
+ * GetProcAddress degli shim restituiva il *simbolo C*: sul modello i386 era corretto (stessa
+ * convenzione di chiamata), qui il guest chiamerebbe una funzione AAPCS con argomenti sulla pila
+ * del guest. Questo file forza la generazione dello stub con ABI del guest per i nomi noti.
+ *
+ * DYNAMIC(<simbolo>): deve avere un prototipo negli shim (l'arità viene da lì).
+ */
+DYNAMIC(DirectDrawCreate)
+DYNAMIC(DirectDrawCreateClipper)
+DYNAMIC(DirectSoundCreate)
+DYNAMIC(DirectSoundCreate8)
+DYNAMIC(SnpBind)
+DYNAMIC(SnpQuery)
+/* Slot della tabella NetFunctions di standard.snp: il guest li chiama con `call *slot` dal codice
+ * tradotto, quindi ognuno deve avere uno stub con ABI del guest (come le API risolte a runtime).
+ * Senza stub il guest eseguirebbe la funzione C con la pila host: misurato, fault pc=0x1. */
+DYNAMIC(snp_compare_addresses)
+DYNAMIC(snp_destroy)
+DYNAMIC(snp_free)
+DYNAMIC(snp_free_external)
+DYNAMIC(snp_get_game_info)
+DYNAMIC(snp_get_performance_data)
+DYNAMIC(snp_initialize)
+DYNAMIC(snp_initialize_device)
+DYNAMIC(snp_lock_device_list)
+DYNAMIC(snp_lock_game_list)
+DYNAMIC(snp_receive)
+DYNAMIC(snp_receive_external)
+DYNAMIC(snp_unknown_select_game)
+DYNAMIC(snp_send)
+DYNAMIC(snp_send_external)
+DYNAMIC(snp_start_advertising_ladder)
+DYNAMIC(snp_stop_advertising)
+DYNAMIC(snp_unlock_device_list)
+DYNAMIC(snp_unlock_game_list)
+DYNAMIC(snp_start_advertising)
+DYNAMIC(snp_unknown_report_result)
+DYNAMIC(snp_check_data_file)
+DYNAMIC(snp_league_command)
+DYNAMIC(snp_league_send_replay)
+DYNAMIC(snp_league_get_replay)
+DYNAMIC(snp_league_logout)
+DYNAMIC(snp_league_get_name)

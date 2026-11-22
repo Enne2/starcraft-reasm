@@ -1,0 +1,90 @@
+/* runtime/arm/bridge_table.def — Win32 imports resolved by ARMV6 C code.
+ *
+ * One line per import the guest may call by name. Columns:
+ *     ENTRY(<symbol>, <number of stdcall arguments>, <C implementation>)
+ *
+ * <symbol> is the name the emitter uses (`proc <symbol> external` in the .llasm, i.e. the PE
+ * import name, or `ordinal_<hexdll>_<n>` for ordinals) — never a label invented here.
+ * <number of stdcall arguments> is the callee-pop count: it is what `ret N` means on x86 and
+ * what the bridge uses to adjust the guest stack. Getting it wrong silently shifts esp, so each
+ * entry carries the count and the smoke test re-checks the value through a stack-canary call.
+ *
+ * The order of this file defines the stub indices — the .S file and the C table are generated
+ * from this single source, so they cannot drift apart.
+ *
+ * Not listed here on purpose: imports belonging to storm.dll. Storm is translated in-process
+ * and must be reached at its own VA (arm_bridge_ordinal_va), never through a C re-implementation.
+ */
+#ifndef ENTRY
+#error "bridge_table.def must be included with ENTRY(symbol, nargs, impl) defined"
+#endif
+
+/* --- error state: lives in the emulated TEB (fs:0x34), not in a C global --- */
+ENTRY(GetLastError,                 0, imp_GetLastError)
+ENTRY(SetLastError,                 1, imp_SetLastError)
+
+/* --- time / scheduling --- */
+ENTRY(GetTickCount,                 0, imp_GetTickCount)
+ENTRY(Sleep,                        1, imp_Sleep)
+ENTRY(timeGetTime,                  0, imp_GetTickCount)
+
+/* --- process / thread identity --- */
+ENTRY(GetCurrentThreadId,           0, imp_GetCurrentThreadId)
+ENTRY(CreateThread,                 6, imp_CreateThread)
+/* DialogProc: il proc arriva qui come ingresso tradotto; allo shim si passa un trampolino C-ABI
+ * che lo invoca con l'ABI del guest (vedi HAND_WINS_OVER_SHIM e imp_DialogBoxParamA). */
+ENTRY(DialogBoxParamA,              5, imp_DialogBoxParamA)
+ENTRY(WaitForSingleObject,          2, imp_WaitForSingleObject)
+ENTRY(GetCurrentProcessId,          0, imp_GetCurrentProcessId)
+ENTRY(IsDebuggerPresent,            0, imp_IsDebuggerPresent)
+ENTRY(ExitProcess,                  1, imp_ExitProcess)
+
+/* --- modules: there is exactly one image pair, at its original VAs --- */
+ENTRY(GetModuleHandleA,             1, imp_GetModuleHandleA)
+
+/* --- TLS slots (Windows TLS index space, not the emulated fs: segment) --- */
+ENTRY(TlsAlloc,                     0, imp_TlsAlloc)
+ENTRY(TlsFree,                      1, imp_TlsFree)
+ENTRY(TlsGetValue,                  1, imp_TlsGetValue)
+ENTRY(TlsSetValue,                  2, imp_TlsSetValue)
+
+/* --- diagnostics --- */
+ENTRY(OutputDebugStringA,           1, imp_OutputDebugStringA)
+
+/* --- performance counter: 64-bit out parameter, exercises the edx:eax result path --- */
+ENTRY(QueryPerformanceCounter,      1, imp_QueryPerformanceCounter)
+
+/* __fpmath (dispatcher delle trascendenti di msvcrt.dll) NON e' qui: vedi guest_abs_zero.S.
+ * Misurato: la CRT tradotta lo chiama con opcode 0x1 durante l'init e scarta il risultato; con il
+ * simbolo a 0 prende il proprio ramo interno (loc_404E60) e prosegue molto piu' avanti. La voce
+ * HAND con il log dell'opcode e' stata usata per la misura ed e' documentata nel report. */
+
+/* Test-only entry used by runtime/arm/tests to prove the stdcall bridge ABI end to end
+ * (argument read + result + callee-pop). Not part of any Win32 API. */
+ENTRY(armtest_probe,                1, imp_armtest_probe)
+
+/* --- storm.dll: ___sse2_available_init (VA 0x15040E07), chiamata dal CRT della DLL ----------
+ *
+ * Chi la chiama (IDA storm.lift.dll.i64, decompilato per intero): `sub_1500810F` = `_initterm`
+ * della DLL, che cammina `&unk_150590F0 … < &dword_15059104` e fa `result = (*v2)()` a
+ * 0x1500813D; la voce dell'indice 0x150590F0+0x10 (VA 0x15059100) vale 0x15040E07.
+ *
+ * Perche' serve una voce QUI e non basta la mappa VA della dispatch: il lift rappresenta i
+ * puntatori a funzione nel blob dei dati come indirizzi host del simbolo esterno
+ * (`i32 ptrtoint (void(%_cpu*)* @<simbolo> to i32)`), quindi la parola a VA 0x15059100 non
+ * contiene 0x15040E07 ma l'indirizzo host dello stub UNK `crt_unlifted_15040E07`. La `tcall reg`
+ * di 0x1500813D arriva a reasm_indirect con un target gia' *dentro il .text del port*, che la
+ * dispatch lascia passare con un `bx` (indirect_dispatch.c, regola 2): la tabella VA non viene
+ * consultata. Misurato: SC_BRIDGE_TRACE=1 -> `crt_unlifted_15040E07 @ 0x187b5e4c` (= loc_1500813F),
+ * poi stop. Dettagli e catena completa in work/link/REPORT-flash-storm.md §1.
+ *
+ * ABI guest (IDA 0x15040E07-0x15040ECF): `int __cdecl ()` — 0 argomenti, il callee non poppa
+ * nulla, ritorna 0 (0x15040EC7). Lo stub generato per una voce ENTRY ha esattamente questa
+ * forma (il dispatcher poppa il return EIP, chiama la C, poppa 0 argomenti e salta al ritorno),
+ * quindi il corpo e' indistinguibile da una procedura tradotta.
+ *
+ * Semantica: su ARM1176 il bit ID di EFLAGS non e' commutabile -> niente cpuid -> i due flag
+ * SSE2 della DLL restano 0 e il ritorno e' 0. Corpo provato in runtime/arm/crt_init_arm.c
+ * (`__sse2_available_init_storm_body`, globals 0x1505FC20 / 0x1505FC1C), lo stesso che serve la
+ * voce `--map-extra 0x15040E07=__sse2_available_init_storm` per chi salta al VA nudo. */
+ENTRY(crt_unlifted_15040E07,        0, imp_crt_unlifted_15040E07)

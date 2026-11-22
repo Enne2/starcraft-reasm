@@ -1,0 +1,46 @@
+proc fixture_entry global c_fixture_entry
+;push ebp
+PUSH ebp
+
+;mov ebp, esp
+mov ebp, esp
+
+;mov eax, ordinal_storm_dll_1
+mov eax, ordinal_storm_dll_1
+
+;call eax
+PUSH loc_40100A
+tcall eax
+endp
+
+proc loc_40100A
+;mov ecx, eax
+mov ecx, eax
+
+;mov edx, [ebp+0x8]
+add tmpadr, ebp, 8
+load edx, tmpadr, 1
+
+;mov eax, edx
+mov eax, edx
+
+;add eax, eax
+add eax, eax, eax
+
+;add eax, edx
+add eax, eax, edx
+
+;add eax, ecx
+add eax, eax, ecx
+
+;add eax, 0x7
+add eax, eax, 7
+
+;pop ebp
+POP ebp
+
+;ret
+POP tmp1
+tcall tmp1
+endp
+

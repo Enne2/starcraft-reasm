@@ -1,0 +1,81 @@
+--- a/tools/elf/win32_ui.c
++++ b/tools/elf/win32_ui.c
+@@ -442,6 +442,20 @@
+     }
+ }
+ 
++/* --- guest callbacks (ARM port) ---
++ * On i386 the game's window/dialog procedures were native code at their VA, so this file could
++ * call them through a function pointer. In the LLASM model a procedure is a translation that
++ * takes the emulated %_cpu and returns by branching to the VA it popped: it can only be entered
++ * through the runtime call-out, which pushes the arguments on the guest stack and runs the guest
++ * until it returns. On i386 the hook is absent and the direct call below is used unchanged. */
++#if defined(__arm__)
++extern int arm_guest_call4(unsigned int proc, unsigned int a, unsigned int b,
++                           unsigned int c, unsigned int d) __attribute__((weak));
++#define GUEST_CALLABLE(p) (arm_guest_call4 != 0)
++#else
++#define GUEST_CALLABLE(p) 0
++#endif
++
+ /* --- wsprintfA ---
+  * ATTENZIONE: NON e' stdcall, e' __cdecl con varargs: il chiamante pulisce la pila. Dichiararla
+  * stdcall sfaserebbe la pila a ogni chiamata. storm la usa moltissimo. */
+@@ -932,9 +946,17 @@
+             hwnd,w?w->cls:"none",w?w->parent:0,msg,wp,lp,w?(unsigned int)(unsigned long)w->wndproc:0,g_focus,g_capture); reasm_elf_log(b);
+     }
+     if (w && w->wndproc) {
++        int result;
++#if defined(__arm__)
++        if (GUEST_CALLABLE(w->wndproc)) {
++            result = arm_guest_call4((unsigned int)(unsigned long) w->wndproc, hwnd, msg, wp, lp);
++        } else
++#endif
++        {
+         int (__attribute__((stdcall)) *p)(unsigned int, unsigned int, unsigned int, unsigned int) =
+             (int (__attribute__((stdcall)) *)(unsigned int, unsigned int, unsigned int, unsigned int)) w->wndproc;
+-        int result=p(hwnd, msg, wp, lp);
++        result=p(hwnd, msg, wp, lp);
++        }
+         if(g_uitrace && (msg==0x201 || msg==0x202)) {
+             int cursor[2]={-1,-1},wr[4]={0,0,0,0},cr[4]={0,0,0,0}; char b[240];
+             unsigned int ms=*(volatile unsigned short *)0x6CDDC0u;
+@@ -949,6 +971,10 @@
+     return DefWindowProcA(hwnd, msg, wp, lp);
+ }
+ S int CallWindowProcA(void *proc, unsigned int h, unsigned int m, unsigned int w, unsigned int l) {
++#if defined(__arm__)
++    if (proc && GUEST_CALLABLE(proc))
++        return arm_guest_call4((unsigned int)(unsigned long) proc, h, m, w, l);
++#endif
+     return proc ? ((DlgProc)proc)(h,m,w,l) : 0;
+ }
+ static int input_within(unsigned int top,unsigned int h) {
+--- a/tools/elf/dlg_elf.c
++++ b/tools/elf/dlg_elf.c
+@@ -167,6 +167,13 @@
+     if(msg==0x401) { d->defid=wp; return 1; }
+     return 0;
+ }
++/* ARM port: the dialog procedure is a translated guest procedure, reachable only through the
++ * runtime call-out (see the same note in win32_ui.c). On i386 the direct call is kept. */
++#if defined(__arm__)
++extern int arm_guest_call4(unsigned int proc, unsigned int a, unsigned int b,
++                           unsigned int c, unsigned int d) __attribute__((weak));
++#endif
++
+ S int dlg_elf_wndproc(unsigned int h, unsigned int msg, unsigned int wp, unsigned int lp) {
+     Dialog *d=dialog(h); DlgProc p; int ret;
+     if(!d) return 0;
+@@ -177,6 +184,11 @@
+     }
+     SetWindowLongA(h,0,0); /* DWL_MSGRESULT */
+     p=(DlgProc)GetWindowLongA(h,4); /* DWL_DLGPROC */
++#if defined(__arm__)
++    if (p && arm_guest_call4)
++        ret = arm_guest_call4((unsigned int)(unsigned long) p, h, msg, wp, lp);
++    else
++#endif
+     ret=p?p(h,msg,wp,lp):0;
+     if(ret) {
+         if(msg==0x110 || msg==0x138 || msg==0x135 || msg==0x136 || msg==0x137) return ret;

@@ -1,0 +1,3 @@
+LIBRARY storm.dll
+EXPORTS
+  storm_probe @1 NONAME

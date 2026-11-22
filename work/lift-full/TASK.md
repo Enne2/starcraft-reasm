@@ -1,0 +1,12 @@
+Oracolo obbligatorio: copia privata IDA DB dei binari (mai sessioni concorrenti o DB originali). Individua routine con xref/vtable, decompila e leggi per intero prima di ricostruire o escludere; il binario prevale sui docs; rinomina/commenta solo la copia privata; cita VA per ogni costante/decisione; niente deduzioni da screenshot. Nessun ask_user, agenti annidati, git, installazioni di sistema o rete; nessuna esecuzione del gioco completo. Non includere dati riservati nei report.
+Sei owner di work/lift-full/, build/lift-full/, e puoi aggiornare vendor/sr/SRW/ (dopo i controlli esistenti di loader/relocs) e tools/lift-full.sh.
+Obiettivo: portare il lifting completo di StarCraft.exe (~/dev/sc-reasm/bin/StarCraft.exe) e storm.dll.orig (~/dev/sc-reasm/storm/storm.dll.orig) attraverso SRW OUT_LLASM → llasm → LLVM IR → ARMv6 object (.o) via tools/compile-arm.sh.
+Fatti verificati di partenza:
+- Con work/relocs/relocations.csv (31.241 candidati), build/loader/srw-src/SRW.exe riconosce 135/135 import ordinali di storm.dll e si ferma a 0x004F7B6B (fclex) dentro il blocco CRT/math finale (>= 0x4F70F0).
+- build/inventory-exe.json e inventory-storm.json mostrano che TUTTE le 328/324 istruzioni x87/SSE2/MMX non coperte da SR_full_llasm_instr.c risiedono nel blocco CRT MSVC finale (>= 0x4F7B18 in exe, >= 0x1503FFE4 in storm), chiamato da pochissime funzioni di gioco (es. __ftol2 0x4F7B70, __CIpow 0x4F7C30, start_0 0x4F7C8D; e 4 funzioni in storm).
+- Storm si ferma a 0x15043BD6 (fldpi, stesso blocco CRT) dopo il propagatore flag tra regioni.
+Compiti:
+1) Verifica in IDA privata (copie in build/lift-full/) le chiamate al blocco CRT in StarCraft.exe e storm.dll.orig, e gli eventuali stop su confini di regione/flag (es. 0x407939, 0x15005DAA).
+2) Prepara i file .sci (external_procedures.sci per funzioni CRT/math/startup mappate a C, ignored_areas.sci solo per codice CRT/SSE morto o sostituito dimostrato in IDA, instruction_flags.sci solo se dimostrato in IDA) e qualsiasi fix generalizzabile necessario a SRW/llasm.
+3) Produci StarCraft.llasm -> StarCraft.ll -> StarCraft.o (ARMv6) e storm.llasm -> storm.ll -> storm.o (ARMv6), verificando ZERO errori di opt/llc per arm1176jzf-s senza NEON e listando i simboli esterni attesi dal runtime.
+Scrivi work/lift-full/REPORT.md con comandi, conteggi, VA verificati e prossimi passi. Non uscire solo con un piano.

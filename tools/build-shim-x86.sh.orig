@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# Build i686 LLASM helpers and the shim translation units used by the ARM runtime.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+CC="${CC:-clang}"
+OBJCOPY="${OBJCOPY:-llvm-objcopy}"
+NM="${NM:-llvm-nm}"
+READELF="${READELF:-readelf}"
+OUT="$ROOT/build/obj-x86"
+TOOLKIT="${TOOLKIT:-$HOME/dev/reasm-toolkit}"
+LLASM="$ROOT/vendor/sr/SR/llasm-support"
+SHIM="$ROOT/runtime/shim-port/elf"
+rm -rf "$OUT/llasm" "$OUT/shim" "$OUT/shim-redef" "$OUT/shim_check"
+mkdir -p "$OUT/llasm" "$OUT/shim" "$OUT/shim-redef" "$OUT/shim_check"
+
+# These are the 11 helper translation units selected by tools/build-runtime-arm.sh stage 4.
+for src in "$LLASM"/llasm_*.c; do
+  [[ "$(basename "$src")" == llasm_cmps.c ]] && src="$ROOT/runtime/common/llasm_cmps.c"
+  "$CC" --target=i686-unknown-linux-gnu -m32 -fno-pie -O2 \
+    -I "$LLASM" -c "$src" -o "$OUT/llasm/$(basename "${src%.c}").o"
+done
+
+# Shim TUs are the runtime's selected set (see tools/build-runtime-arm.sh stage 8.4),
+# not test/diagnostic-only C files also present in shim-port/elf.
+shim_files=(win32_shim win32_ui gdi_elf com_ddraw com_dsound host_elf dlg_elf input_elf
+            win32_game win32_shell_dlg smack_elf smack_audio snp_elf)
+SDL_CFLAGS=()
+if command -v pkg-config >/dev/null && pkg-config --exists sdl2; then
+  read -r -a SDL_CFLAGS <<<"$(pkg-config --cflags sdl2)"
+else
+  SDL_CFLAGS=(-I/usr/include/SDL2 -D_REENTRANT)
+fi
+for name in "${shim_files[@]}"; do
+  extra=(-DSC_PORT_EMULATED_TEB=1)
+  [[ "$name" == win32_ui ]] && extra+=(-DSC_ELF_REAL_GDI=1)
+  "$CC" --target=i686-unknown-linux-gnu -m32 -fno-pie -O1 -g \
+    -Wno-ignored-attributes -Wno-incompatible-library-redeclaration \
+    -Wno-string-compare -Wno-self-assign -Wno-builtin-requires-header -include stdint.h \
+    "${SDL_CFLAGS[@]}" -I "$SHIM" -I "$ROOT/runtime/common" \
+    -I "$TOOLKIT/runtime/elf" -I "$ROOT/vendor/sr/SR/llasm-support" "${extra[@]}" \
+    -c "$SHIM/$name.c" -o "$OUT/shim/$name.o"
+done
+
+# Regenerate the ABI manifests using the checked-in symbol set as the request set; this
+# isolates the target ABI/prototype parsing and avoids rebuilding the full lifted game.
+python3 - "$ROOT/runtime/shim-port/bridge_shims.def" "$OUT/shim_check/need.txt" <<'PY'
+import re, sys
+src, dst = sys.argv[1:]
+seen=[]
+for line in open(src):
+    m=re.match(r'\s*(?:SHIM\(\s*(\w+)|UNK\(\s*(\w+))', line)
+    if m: seen.append(next(x for x in m.groups() if x))
+open(dst,'w').write(''.join(x+'\n' for x in sorted(set(seen))))
+PY
+: > "$OUT/shim_check/defined.txt"
+"$CC" --target=i686-unknown-linux-gnu -m32 -fno-pie -fsyntax-only -x c /dev/null
+shim_csv=$(IFS=,; echo "${shim_files[*]}")
+# gen_shims_bridge.py's rindex(')') misreads i386 stdcall attributes; invoke its main with a
+# balanced parameter parser while preserving all generator logic and inputs.
+python3 - "$ROOT/runtime/common/gen_shims_bridge.py" \
+  --need "$OUT/shim_check/need.txt" --defined "$OUT/shim_check/defined.txt" \
+  --shim-dir "$SHIM" \
+  --shims "$shim_csv" \
+  --clang-flags "--target=i686-unknown-linux-gnu -m32 -fno-pie -I $SHIM -I $ROOT/runtime/common -I $TOOLKIT/runtime/elf -I $ROOT/vendor/sr/SR/llasm-support -I/usr/include/SDL2 -D_REENTRANT -DSC_ELF_REAL_GDI=1 -include stdint.h -Wno-ignored-attributes -Wno-incompatible-library-redeclaration" \
+  --extra-def "$ROOT/runtime/common/bridge_unk.def" \
+  --dynamic "$ROOT/runtime/common/bridge_dynamic.def" \
+  --hand-def "$ROOT/runtime/common/bridge_table.def" \
+  --out-def "$OUT/shim_check/bridge_shims.i686.def" \
+  --out-rename "$OUT/shim_check/shim_rename.i686.txt" \
+  --out-impl "$OUT/shim_check/shim_calls.i686.c" <<'PY'
+import importlib.util, sys
+script, *args = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("gen_shims_bridge", script)
+g = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(g)
+def balanced_parse_sig(sig):
+    lp = sig.find('(')
+    if lp < 0:
+        return None
+    depth = 0
+    rp = -1
+    for i in range(lp, len(sig)):
+        if sig[i] == '(': depth += 1
+        elif sig[i] == ')':
+            depth -= 1
+            if depth == 0:
+                rp = i
+                break
+    if rp < 0: return None
+    ret = sig[:lp].strip()
+    params = sig[lp + 1:rp].strip()
+    variadic = params.endswith('...')
+    core = params.replace('...', '').strip().rstrip(',').strip()
+    n = 0 if core in ('', 'void') else 1 + core.count(',')
+    stdcall = ret.startswith('S ') or '__attribute__((stdcall))' in sig
+    return n, stdcall, variadic, ret
+g.parse_sig = balanced_parse_sig
+sys.argv = [script] + args
+raise SystemExit(g.main())
+PY
+
+for obj in "$OUT/shim"/*.o; do
+  "$OBJCOPY" --redefine-syms="$ROOT/runtime/shim-port/shim_rename.txt" \
+    "$obj" "$OUT/shim-redef/$(basename "$obj")"
+done
+
+# Structural checks and forbidden ARM references in the generated object set.
+for obj in "$OUT"/llasm/*.o "$OUT"/shim/*.o "$OUT"/shim-redef/*.o; do
+  hdr=$(LC_ALL=C "$READELF" -h "$obj")
+  grep -q 'Class:.*ELF32' <<<"$hdr" || { echo "not ELF32: $obj" >&2; exit 1; }
+  grep -q 'Machine:.*Intel 80386' <<<"$hdr" || { echo "not i386: $obj" >&2; exit 1; }
+done
+"$NM" -u "$OUT/shim-redef"/*.o > "$OUT/shim_check/undefined-redefined.txt"
+# Guest-facing dynamic API/COM calls intentionally reference these shared bridge helpers;
+# runtime/common/elf_support_arm.c and com_bridge_arm.c provide them in the linked i386 runtime.
+if grep -Ev ' [Uw] (arm_bridge_lookup_thunk|arm_com_wrap_vtable|arm_com_thunk)$' \
+    "$OUT/shim_check/undefined-redefined.txt" | \
+    grep -Eiq '(__aeabi_|arm_bridge|arm_com_thunk|__arm__)'; then
+  echo "unexpected ARM references in i686 shim objects" >&2
+  exit 1
+fi
+python3 - "$NM" "$OUT/shim-redef" "$OUT/shim_check" <<'PY'
+import collections, glob, subprocess, sys
+nm, directory, out = sys.argv[1:]
+defs = collections.defaultdict(list)
+for obj in glob.glob(directory + '/*.o'):
+    for line in subprocess.check_output([nm, '--defined-only', obj], text=True).splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[-2].isupper() and fields[-2] not in ('U', '?'):
+            defs[fields[-1]].append(obj)
+dups = {name: paths for name, paths in defs.items() if len(paths) > 1}
+if dups:
+    for name, paths in sorted(dups.items()): print(name, *paths, file=sys.stderr)
+    raise SystemExit('global symbol collision in redefined shim objects')
+renamed = sorted(name for name in defs if name.endswith('__c'))
+open(out + '/renamed-symbols.txt', 'w').write(''.join(x+'\n' for x in renamed))
+print('global collisions: 0; renamed C symbols:', len(renamed))
+PY
+diff -u "$ROOT/runtime/shim-port/bridge_shims.def" "$OUT/shim_check/bridge_shims.i686.def" \
+  > "$OUT/shim_check/bridge_shims.diff" || true
+diff -u "$ROOT/runtime/shim-port/shim_rename.txt" "$OUT/shim_check/shim_rename.i686.txt" \
+  > "$OUT/shim_check/shim_rename.diff" || true
+printf 'i686 objects: %s llasm, %s shim; all ELF32/Intel 80386; symbol rewrite done\n' "$(find "$OUT/llasm" -name '*.o' | wc -l)" "$(find "$OUT/shim" -name '*.o' | wc -l)"

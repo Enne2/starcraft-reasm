@@ -1,0 +1,12 @@
+Oracolo obbligatorio: per ogni interfaccia binaria o convenzione di chiamata usa IDA su copia privata o gli artefatti verificati di sc-reasm/docs + source (mai sessioni IDA concorrenti). Nessun ask_user, agenti annidati, git, installazioni di sistema o rete; non modificare sc-reasm o m-ht-sr. Non includere dati riservati nei report.
+Sei owner di runtime/arm/, build/sysroot/, build/runtime-arm/, work/runtime-arm/ e tools/build-runtime-arm.sh.
+Obiettivo: preparare l'ambiente di compilazione e il runtime Linux ARMv6 (Raspberry Pi OS Bookworm armhf) per collegare gli oggetti LLVM-ARMv6 generati da SRW/LLASM + gli shim C/SDL2 esistenti di ~/dev/sc-reasm/tools/elf/.
+Compiti:
+1) Estrai in build/sysroot/ i file necessari dall'immagine ufficiale read-only build/qemu/2026-04-13-raspios-bookworm-armhf.img (partizione ext4 p2 con debugfs o Python/fuse2fs senza sudo): /lib/arm-linux-gnueabihf, /usr/lib/arm-linux-gnueabihf, /usr/include, libSDL2-2.0.so.0, crt*.o, linker dinamico ld-linux-armhf.so.3. Verifica compilazione e link di un programma C+SDL2 ARMv6 (arm1176jzf-s, VFPv2 hard-float, no NEON) contro questo sysroot e esecuzione con qemu-arm-static -cpu arm1176 -L build/sysroot.
+2) Studia vendor/sr/SR/llasm-support/, vendor/sr/SR/games/Warcraft/SR-War/llasm/ (o m-ht-sr/games/Septerra Core/SRW-Main/ per la struttura SRW+LLASM) e ~/dev/sc-reasm/tools/elf/{win32_shim.c,win32_ui.c,gdi_elf.c,com_ddraw.c,com_dsound.c,host_elf.c,dlg_elf.c,input_elf.c,win32_game.c,main_elf.c}.
+3) Implementa in runtime/arm/:
+   - cpu_llasm.c / x86_helpers.c (helper chiamati dall'IR LLASM: div/idiv, string ops, x87/FPU software, read/write fs dword -> TEB emulato portabile senza %fs x86, call/bridge ABI);
+   - game_memory_arm.c: mapping delle sezioni/heap ai VA originali sotto 0x80000000 (requisito ~ptr di storm.dll) compatibile con Raspberry Pi OS ARMv6 (32-bit, niente MAP_32BIT);
+   - adattamento portabile degli shim C/SDL2 di sc-reasm/tools/elf (riuso massimo del codice C esistente, rimuovendo dipendenze inline asm i386 / %fs / syscall i386) + tabella bridge dagli import ordinali di Storm/Win32 ai simboli emessi da SRW-llasm.
+4) Smoke test eseguibile: compila un piccolo ELF ARMv6 linkato dinamicamente al sysroot Raspberry Pi OS che invoca il runtime + SDL2 (SDL_VIDEODRIVER=dummy o fbdev) e gli helper LLASM sotto qemu-arm-static -cpu arm1176 -L build/sysroot.
+Scrivi work/runtime-arm/REPORT.md con inventario file, simboli coperti, dipendenze e stato verifiche. Non uscire solo con un piano.

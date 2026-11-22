@@ -1,0 +1,17 @@
+--- a/tools/elf/win32_shim.c
++++ b/tools/elf/win32_shim.c
+@@ -896,6 +896,14 @@
+ }
+ S void *GetProcAddress(void *m, const char *n) {
+     void *p;
++#if defined(__arm__)
++    /* ARM port: the guest needs the guest-ABI thunk, not the C symbol. On i386 the two coincide
++     * (same calling convention, stdcall pops), so the tables below could return the C address;
++     * here they would hand the guest a function that reads its arguments from r0-r3 while the
++     * guest pushed them on the emulated x86 stack. The bridge is therefore consulted first. */
++    { extern void *arm_bridge_lookup_thunk(const char *) __attribute__((weak));
++      if (arm_bridge_lookup_thunk) { p = arm_bridge_lookup_thunk(n); if (p) return p; } }
++#endif
+     if (win32_smack_get_proc) {
+         p = win32_smack_get_proc(m, n);
+         if (p) return p;
