@@ -45,7 +45,28 @@ int main(void) {
         ok &= check(r == -1 && n == 2 && dst[0] == 0xAA && dst[1] == 0xBB,
                     "undersized destination is not modified");
     }
+    {
+        /* Huffman data type outside the 9 rows of table 0x15050030: must fall back, not read OOB. */
+        uint8_t src[] = {0x01, 9, 0, 0, 0, 0}, dst[16] = {0};
+        uint32_t n = sizeof dst;
+        r = storm_scomp_decompress(dst, &n, src, sizeof src);
+        ok &= check(r == -1 && n == sizeof dst, "Huffman rejects an out-of-range data type");
+    }
+    {
+        /* Truncated Huffman bit stream (no payload bytes after the type byte). */
+        uint8_t src[] = {0x01, 8}, dst[16] = {0};
+        uint32_t n = sizeof dst;
+        r = storm_scomp_decompress(dst, &n, src, sizeof src);
+        ok &= check(r == -1, "Huffman requests fallback on a truncated bit stream");
+    }
+    {
+        /* Huffman -> ADPCM chain with a truncated stream must also fall back. */
+        uint8_t src[] = {0x81, 8, 0x00}, dst[16] = {0};
+        uint32_t n = sizeof dst;
+        r = storm_scomp_decompress(dst, &n, src, sizeof src);
+        ok &= check(r == -1, "Huffman+ADPCM requests fallback on a truncated bit stream");
+    }
     if (!ok) return 1;
-    puts("x86_scomp_test: PASS (copy paths + synthetic ADPCM; unsupported codecs use lifted fallback)");
+    puts("x86_scomp_test: PASS (copy paths + synthetic ADPCM + Huffman guards; unsupported codecs use lifted fallback)");
     return 0;
 }
