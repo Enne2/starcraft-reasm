@@ -1115,6 +1115,32 @@ extern void com_dsound_note_resolve(unsigned int) __attribute__((weak));
 /* P8: in-process standard.snp provider; battle.snp remains a resource-only module with no exports. */
 extern void *win32_snp_load_library(const char *) __attribute__((weak));
 extern void *win32_snp_get_proc(void *, const char *) __attribute__((weak));
+/* Diagnostica mirata (SC_LIB_TRACE=1): traccia solo la risoluzione dei provider SNP, che il gioco
+ * ottiene via LoadLibraryA+GetProcAddress a runtime (non come import statico). */
+static int lib_trace_snp(const char *n) {
+    static int on = -1;
+    const char *e;
+    int i;
+    if (on < 0) { e = getenv("SC_LIB_TRACE"); on = (e && e[0] != '0') ? 1 : 0; }
+    if (!on || !n) return 0;
+    for (i = 0; n[i]; ++i) {
+        char c = n[i];
+        if (c >= 'A' && c <= 'Z') c = (char) (c - 'A' + 'a');
+        if (c == 's' && n[i+1] && (n[i+1] == 'n' || n[i+1] == 'N') &&
+            n[i+2] && (n[i+2] == 'p' || n[i+2] == 'P')) return 1;
+    }
+    return 0;
+}
+static void lib_trace_line(const char *what, const char *name, void *res) {
+    reasm_elf_log("[lib] ");
+    reasm_elf_log(what);
+    reasm_elf_log("(");
+    reasm_elf_log(name ? name : "(null)");
+    reasm_elf_log(") -> ");
+    reasm_elf_log_hex((unsigned) (unsigned long) res);
+    reasm_elf_log("\n");
+}
+
 S void *LoadLibraryA(const char *n) {
     unsigned int h;
     if (!n) return 0;
@@ -1129,6 +1155,7 @@ S void *LoadLibraryA(const char *n) {
     }
     if (win32_snp_load_library) {
         void *s = win32_snp_load_library(n);
+        if (lib_trace_snp(n)) lib_trace_line("LoadLibraryA[snp]", n, s);
         if (s) return s;
     }
     {   char up[300];
@@ -1148,8 +1175,15 @@ S void *GetProcAddress(void *m, const char *n) {
     void *p;
     /* SnpQuery/SnpBind are module exports, not global Win32 imports. Resolve them only for the
      * native standard.snp module and hand the game the generated guest-ABI bridge thunk. */
-    if (win32_snp_get_proc) { p = win32_snp_get_proc(m, n); if (p) return p; }
-    if (is_snp_export_name(n)) return 0;
+    if (win32_snp_get_proc) {
+        p = win32_snp_get_proc(m, n);
+        if (is_snp_export_name(n)) lib_trace_line("GetProcAddress[Snp]", n, p);
+        if (p) return p;
+    }
+    if (is_snp_export_name(n)) {
+        if (lib_trace_snp(n)) lib_trace_line("GetProcAddress[Snp] FALLITA", n, 0);
+        return 0;
+    }
 #if defined(__arm__) || defined(SC_PORT_EMULATED_TEB)
     /* Translated guest code must call through a guest-ABI thunk, not the C symbol. This is true
      * on both ARM and i386: even though i386 stdcall uses the same stack ABI, LLASM entries take
