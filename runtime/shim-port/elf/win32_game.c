@@ -3,7 +3,16 @@
  * No guessed APIs, fallback stubs, new HWND registry, or Windows DLLs.
  */
 #include "win32_game.h"
+#if defined(__arm__)
+#include <fcntl.h>
+#define GAME_O_DIRECTORY O_DIRECTORY
+#else
+#define GAME_O_DIRECTORY 0x10000
+#endif
 extern void *malloc(unsigned long);
+extern char *getenv(const char *);
+extern long write(int, const void *, unsigned long);
+extern void reasm_elf_log(const char *);
 extern void free(void *);
 extern unsigned long strlen(const char *);
 extern int strcmp(const char *, const char *);
@@ -286,7 +295,7 @@ int GAME_STDCALL game_CreateDirectoryA(const char *path, void *security) {
     leaf = strrchr(native, '/');
     if (!leaf || !leaf[1]) { SetLastError(123); return 0; }
     *leaf++ = 0;
-    fd = reasm_open_ci(*native ? native : "/", 0x10000, 0);
+    fd = reasm_open_ci(*native ? native : "/", GAME_O_DIRECTORY, 0);
     if (fd < 0) { SetLastError(file_error(*__errno_location())); return 0; }
     rc = mkdirat(fd, leaf, 0777); e = *__errno_location(); close(fd);
     if (rc) { SetLastError(file_error(e)); return 0; }
@@ -356,15 +365,41 @@ static int search_next(Search *s, GameFindData *data) {
         return 1;
     }
 }
+/* Diagnostica enumerazione (REASM_TRACE=1): pattern del guest, path nativo risolto, esito.
+ * Serve a distinguere "il guest non chiede nulla" da "la directory non si apre" da "nessun match". */
+static int ff_trace_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("REASM_TRACE"); on = (v && *v) ? 1 : 0; }
+    return on;
+}
+static void ff_trace(const char *what, const char *a, const char *b, int num) {
+    char buf[96];
+    int i = 0, k;
+    const char *hx = "0123456789ABCDEF";
+    if (!ff_trace_on()) return;
+    write(2, "[ff] ", 5);
+    while (what && *what && i < 30) { buf[i++] = *what++; }
+    write(2, buf, (unsigned long) i);
+    if (a) { write(2, " pat=", 5); reasm_elf_log(a); }
+    if (b) { write(2, " native=", 8); reasm_elf_log(b); }
+    i = 0;
+    buf[i++] = ' '; buf[i++] = 'r'; buf[i++] = 'c'; buf[i++] = '=';
+    buf[i++] = '0'; buf[i++] = 'x';
+    for (k = 0; k < 8; ++k) buf[i++] = hx[(num >> (28 - 4 * k)) & 0xF];
+    buf[i++] = '\n';
+    write(2, buf, (unsigned long) i);
+}
+
 void *GAME_STDCALL game_FindFirstFileA(const char *pattern, GameFindData *data) {
     char native[512], *leaf; int fd; void *dir; Search *s; game_u32 e;
     if (!data) { SetLastError(87); return (void *)-1; }
-    if (!file_path(pattern, native)) return (void *)-1;
+    if (!file_path(pattern, native)) { ff_trace("path-fail", pattern, 0, -1); return (void *)-1; }
     leaf = strrchr(native, '/');
     if (!leaf || !leaf[1]) { SetLastError(123); return (void *)-1; }
     *leaf++ = 0;
-    fd = reasm_open_ci(*native ? native : "/", 0x10000, 0);
-    if (fd < 0) { SetLastError(file_error(*__errno_location())); return (void *)-1; }
+    fd = reasm_open_ci(*native ? native : "/", GAME_O_DIRECTORY, 0);
+    if (fd < 0) { ff_trace("dir-fail", pattern, native, *__errno_location()); SetLastError(file_error(*__errno_location())); return (void *)-1; }
+    ff_trace("dir-open", pattern, native, fd);
     dir = fdopendir(fd);
     if (!dir) { e = file_error(*__errno_location()); close(fd); SetLastError(e); return (void *)-1; }
     s = malloc(sizeof *s);
@@ -372,14 +407,17 @@ void *GAME_STDCALL game_FindFirstFileA(const char *pattern, GameFindData *data) 
     s->dir = dir; memcpy(s->pattern, leaf, strlen(leaf)+1);
     if (!search_next(s, data)) {
         extern game_u32 GAME_STDCALL GetLastError(void);
-        e = GetLastError(); closedir(dir); free(s); SetLastError(e == 18 ? 2 : e); return (void *)-1;
+        e = GetLastError(); ff_trace("no-match", pattern, native, (int)e);
+        closedir(dir); free(s); SetLastError(e == 18 ? 2 : e); return (void *)-1;
     }
     pthread_mutex_lock(&searches_mutex);
     if (next_search == 0x76FFFFFFu) {
         pthread_mutex_unlock(&searches_mutex); closedir(dir); free(s); SetLastError(8); return (void *)-1;
     }
     s->handle = ++next_search; s->next = searches; searches = s;
-    pthread_mutex_unlock(&searches_mutex); return (void *)s->handle;
+    pthread_mutex_unlock(&searches_mutex);
+    ff_trace("first-match", pattern, data->filename, (int)s->handle);
+    return (void *)s->handle;
 }
 int GAME_STDCALL game_FindNextFileA(void *handle, GameFindData *data) {
     Search *s; int rc;

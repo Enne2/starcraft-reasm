@@ -168,7 +168,11 @@ static int make_unix(const char *path) {
     struct sockaddr_un a; int fd;
     if(strlen(path)>=sizeof a.sun_path)return -1;
     fd=socket(AF_UNIX,SOCK_STREAM,0);if(fd<0)return -1;memset(&a,0,sizeof a);a.sun_family=AF_UNIX;strcpy(a.sun_path,path);
-    if(bind(fd,(struct sockaddr *)&a,sizeof a)||listen(fd,4)){close(fd);return -1;}strcpy(unix_path,path);return fd;
+    /* un socket orfano (kill -9 dell'istanza precedente) farebbe fallire il bind: se nessuno
+     * risponde, il file e' nostro e si puo' rimuovere. */
+    if(bind(fd,(struct sockaddr *)&a,sizeof a)!=0 && *path){ unlink(path);
+        if(bind(fd,(struct sockaddr *)&a,sizeof a)!=0){close(fd);return -1;} }
+    if(listen(fd,4)){close(fd);return -1;}strcpy(unix_path,path);return fd;
 }
 static int make_tcp(const char *port) {
     struct sockaddr_in a; char *end; long p=strtol(port,&end,10);int fd,one=1;

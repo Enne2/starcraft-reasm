@@ -1,0 +1,23 @@
+#!/bin/sh
+# Launcher StarCraft ARMv7 (Pinebook Pro): ambiente completo, avvio dalla dir con gli asset.
+GAMEDIR="${SC_DIR:-$HOME/starcraft-armv7-test}"
+cd "$GAMEDIR" || exit 1
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DISPLAY="${DISPLAY:-:0}"
+if [ -z "${XAUTHORITY:-}" ]; then
+  for f in "$XDG_RUNTIME_DIR"/.mutter-Xwaylandauth.* ; do
+    [ -e "$f" ] && { XAUTHORITY="$f"; export XAUTHORITY; break; }
+  done
+fi
+if [ -S "$GAMEDIR/sc-ctl.sock" ] && ! pgrep -f "$GAMEDIR/starcraft-armv7" >/dev/null 2>&1; then
+  rm -f "$GAMEDIR/sc-ctl.sock"
+fi
+export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-x11}"
+export SDL_AUDIODRIVER="${SDL_AUDIODRIVER:-pulseaudio}"
+export PULSE_SERVER="${PULSE_SERVER:-unix:$XDG_RUNTIME_DIR/pulse/native}"
+export SC_SMACKER_SO="$GAMEDIR/libsmacker-1.2.0.so"
+export SC_SKIP_INTRO="${SC_SKIP_INTRO:-0}"
+export SC_FPS_CAP="${SC_FPS_CAP:-25}"
+export SC_FPS_LOG="${SC_FPS_LOG:-1}"
+export SC_CTL="${SC_CTL:-1}"
+exec ./starcraft-armv7 "$@"

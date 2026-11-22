@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=StarCraft (ARMv7)
+GenericName=Real-time strategy
+Comment=StarCraft 1.16.1 ricompilato nativamente per ARMv7 (runtime reasm)
+Exec=/home/enne2/.local/bin/starcraft-armv7
+Path=/home/enne2/starcraft-armv7-test
+Icon=/home/enne2/.local/share/icons/hicolor/256x256/apps/starcraft-armv7.png
+Terminal=false
+StartupNotify=true
+Categories=Game;StrategyGame;
+Keywords=starcraft;rts;blizzard;
