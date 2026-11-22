@@ -680,6 +680,24 @@ void storm_334_arm_body(_cpu *cpu) {
           if (!range_2d(dst,rows,640u,dst_delta,1) || !range_2d(src,rows,320u,src_delta,0))
               fail73("2x LUT surface span",0,flags);
           run_2x_lut(cpu,entry,p,rows,dst_delta,src_delta);
+          if (scode_trace_on()) {
+              static int video_surface_reported;
+              if (!video_surface_reported) {
+                  uint8_t *canvas; int cw=0,ch=0,cp=0; uint32_t nz_src=0,nz_dst=0,nz_canvas=0,y,x;
+                  extern unsigned char *host_elf_canvas(int *,int *,int *);
+                  for(y=0;y<rows;y++) for(x=0;x<320u;x++) nz_src+=((uint8_t *)(unsigned long)src)[(int64_t)y*(320+(int32_t)src_delta)+x]!=0;
+                  if (nz_src) {
+                      canvas=host_elf_canvas(&cw,&ch,&cp);
+                      for(y=0;y<rows;y++) for(x=0;x<640u;x++) nz_dst+=((uint8_t *)(unsigned long)dst)[(int64_t)y*(640+(int32_t)dst_delta)+x]!=0;
+                      if (canvas && cw>=640 && ch>=480 && cp>=640)
+                          for(y=0;y<480u;y++) for(x=0;x<640u;x++) nz_canvas+=canvas[(unsigned long)y*cp+x]!=0;
+                      log_s("[storm-scode-video] src/dst/canvas="); log_hex(src); log_hex(dst);
+                      log_hex((uint32_t)(unsigned long)canvas); log_s(" rows/delta="); log_hex(rows); log_hex(dst_delta);
+                      log_s(" nonzero src/dst/canvas="); log_hex(nz_src); log_hex(nz_dst); log_hex(nz_canvas); log_s("\\n");
+                      video_surface_reported=1;
+                  }
+              }
+          }
       } else {
           static int fallback_announced;
           if (!fallback_announced) {

@@ -22,6 +22,12 @@ else:
 assert state.startswith("ok state frame=") and "w=640 h=480" in state and "pal=1" in state, state
 reply=call("shot " + png)
 assert reply.startswith("ok shot "), reply
+raw_path=os.path.join(os.path.dirname(png), "canvas.raw")
+reply=call("rawshot " + raw_path)
+assert reply.startswith("ok rawshot "), reply
+raw_canvas=open(raw_path,"rb").read()
+assert len(raw_canvas)==640*480 and set(raw_canvas)=={1}, (len(raw_canvas), set(raw_canvas))
+assert os.path.isfile(raw_path + ".png"), "rawshot must save a palette-rendered PNG from the same captured frame"
 b=open(png,"rb").read(); assert b[:8]==b"\x89PNG\r\n\x1a\n"
 o=8; chunks=[]; width=height=None
 while o<len(b):

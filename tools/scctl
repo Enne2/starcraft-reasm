@@ -33,6 +33,7 @@ def main():
     p.add_argument("--sock", default=os.environ.get("SC_CTL_SOCK", "./sc-ctl.sock"))
     sub = p.add_subparsers(dest="cmd", required=True)
     q = sub.add_parser("shot"); q.add_argument("path")
+    q = sub.add_parser("rawshot", help="save indexed bytes plus matching palette-rendered PATH.png"); q.add_argument("path")
     q = sub.add_parser("click"); q.add_argument("x", type=int); q.add_argument("y", type=int); q.add_argument("btn", nargs="?", type=int, default=1)
     q = sub.add_parser("move"); q.add_argument("x", type=int); q.add_argument("y", type=int)
     q = sub.add_parser("down"); q.add_argument("x", type=int); q.add_argument("y", type=int); q.add_argument("btn", nargs="?", type=int, default=1)
@@ -55,7 +56,8 @@ def main():
                         command(a.sock, line)
             return
         args = vars(a)
-        if a.cmd in ("shot",): text = f"shot {a.path}"
+        if a.cmd == "shot": text = f"shot {a.path}"
+        elif a.cmd == "rawshot": text = f"rawshot {a.path}"
         elif a.cmd in ("click", "down", "up"): text = f"{a.cmd} {a.x} {a.y} {a.btn}"
         elif a.cmd == "move": text = f"move {a.x} {a.y}"
         elif a.cmd in ("key", "keydown", "keyup"): text = f"{a.cmd} {a.key}"

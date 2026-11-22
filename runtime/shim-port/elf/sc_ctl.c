@@ -22,7 +22,8 @@
 #define SC_CTL_LINE 2048
 
 static unsigned char snap[SC_CTL_RGB];
-static atomic_int snap_state; /* 0 idle, 1 requested, 2 ready */
+static unsigned char snap_idx[SC_CTL_PIXELS];
+static atomic_int snap_state; /* 0 idle, 1 RGB requested, 2 ready, 3 indexed requested */
 static atomic_ulong presented_count;
 static atomic_int palette_present;
 static atomic_int running;
@@ -56,6 +57,13 @@ static int png_chunk(int fd, const char type[4], const unsigned char *data, unsi
     }
     be32(c,crc);
     return write_all(fd,h,8) || (len && write_all(fd,data,len)) || write_all(fd,c,4) ? -1:0;
+}
+static int save_raw(const char *path, const unsigned char *pixels) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    if (write_all(fd, pixels, SC_CTL_PIXELS) != 0) { close(fd); return -1; }
+    close(fd);
+    return 0;
 }
 static int save_png(const char *path, const unsigned char *rgb) {
     unsigned char ihdr[13], zhead[2]={0x78,0x01}, block[5], adbuf[4];
@@ -115,15 +123,23 @@ static void handle(int fd,char *line) {
     if(!*line)return;
     if(!strcmp(line,"quit")){send_line(fd,"ok quit\n");shutdown(fd,SHUT_RDWR);return;}
     if(!strcmp(line,"state")) { snprintf(out,sizeof out,"ok state frame=%lu w=640 h=480 presented=%lu pal=%d\n",atomic_load(&presented_count),atomic_load(&presented_count),atomic_load(&palette_present));send_line(fd,out);return; }
-    if(!strncmp(line,"shot ",5)) {
-        arg=line+5; if(!*arg){send_line(fd,"err shot path\n");return;}
-        { int expected=0; if(!atomic_compare_exchange_strong(&snap_state,&expected,1)){send_line(fd,"err shot busy\n");return;} }
+    if(!strncmp(line,"shot ",5) || !strncmp(line,"rawshot ",8)) {
+        int raw = !strncmp(line,"rawshot ",8);
+        int request = raw ? 3 : 1;
+        arg=line+(raw?8:5); if(!*arg){send_line(fd,"err shot path\n");return;}
+        { int expected=0; if(!atomic_compare_exchange_strong(&snap_state,&expected,request)){send_line(fd,"err shot busy\n");return;} }
         clock_gettime(CLOCK_MONOTONIC,&ts);
         for(;;) { struct timespec now,nap={0,1000000}; if(atomic_load_explicit(&snap_state,memory_order_acquire)==2)break; nanosleep(&nap,0); clock_gettime(CLOCK_MONOTONIC,&now); if(!atomic_load(&running)||now.tv_sec-ts.tv_sec>10){atomic_store(&snap_state,0);send_line(fd,"err shot timeout\n");return;} }
-        if(save_png(arg,snap)){atomic_store(&snap_state,0);snprintf(out,sizeof out,"err shot %s\n",strerror(errno));send_line(fd,out);return;}
+        if((raw?save_raw(arg,snap_idx):save_png(arg,snap))){atomic_store(&snap_state,0);snprintf(out,sizeof out,"err shot %s\n",strerror(errno));send_line(fd,out);return;}
+        if(raw) {
+            char rgb_path[SC_CTL_LINE]; size_t n=strlen(arg);
+            if(n+5>=sizeof rgb_path){atomic_store(&snap_state,0);send_line(fd,"err rawshot path too long\n");return;}
+            memcpy(rgb_path,arg,n); memcpy(rgb_path+n,".png",5);
+            if(save_png(rgb_path,snap)){atomic_store(&snap_state,0);snprintf(out,sizeof out,"err rawshot RGB %s\n",strerror(errno));send_line(fd,out);return;}
+        }
         { int f=open(arg,O_RDONLY); off_t sz=f>=0?lseek(f,0,SEEK_END):-1; if(f>=0)close(f); bytes=sz>0?(unsigned long)sz:0; }
         atomic_store_explicit(&snap_state,0,memory_order_release);
-        snprintf(out,sizeof out,"ok shot %s %lu\n",arg,bytes);send_line(fd,out);return;
+        snprintf(out,sizeof out,"ok %s %s %lu\n",raw?"rawshot":"shot",arg,bytes);send_line(fd,out);return;
     }
     if(sscanf(line,"move %d %d",&x,&y)==2){post(HOST_INPUT_MOVE,x,y,0);send_line(fd,"ok move\n");return;}
     if(sscanf(line,"click %d %d %d",&x,&y,&btn)>=2){if(btn!=1&&btn!=2){send_line(fd,"err btn\n");return;}post(HOST_INPUT_MOVE,x,y,0);post(HOST_INPUT_DOWN,x,y,btn);post(HOST_INPUT_UP,x,y,btn);send_line(fd,"ok click\n");return;}
@@ -197,8 +213,13 @@ void sc_ctl_present(const unsigned char *canvas,int w,int h,int pitch,const unsi
     int state,x,y;
     if(!atomic_load_explicit(&enabled,memory_order_relaxed))return;
     state=atomic_load_explicit(&snap_state,memory_order_acquire);
-    if(state==1&&canvas&&pal&&w>=SC_CTL_W&&h>=SC_CTL_HEIGHT&&pitch>=SC_CTL_W){
-        for(y=0;y<SC_CTL_HEIGHT;++y)for(x=0;x<SC_CTL_W;++x){unsigned int c=pal[canvas[(size_t)y*pitch+x]];size_t o=((size_t)y*SC_CTL_W+x)*3;snap[o]=c>>16;snap[o+1]=c>>8;snap[o+2]=c;}
+    if((state==1||state==3)&&canvas&&pal&&w>=SC_CTL_W&&h>=SC_CTL_HEIGHT&&pitch>=SC_CTL_W){
+        for(y=0;y<SC_CTL_HEIGHT;++y)for(x=0;x<SC_CTL_W;++x){
+            unsigned char idx=canvas[(size_t)y*pitch+x];
+            size_t o=((size_t)y*SC_CTL_W+x)*3;
+            if(state==3) snap_idx[(size_t)y*SC_CTL_W+x]=idx;
+            {unsigned int c=pal[idx];snap[o]=c>>16;snap[o+1]=c>>8;snap[o+2]=c;}
+        }
         atomic_store_explicit(&snap_state,2,memory_order_release);
     }
     if(atomic_load(&text_state)==1){struct host_input_event e;memset(&e,0,sizeof e);e.type=HOST_INPUT_TEXT;memcpy(e.text,text_buf,sizeof e.text);if(host_elf_test_text(e.text)>0)atomic_store_explicit(&text_state,2,memory_order_release);}

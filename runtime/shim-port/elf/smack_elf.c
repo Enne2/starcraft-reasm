@@ -173,6 +173,7 @@ static int lib_load(void)
 #define SMK_PRIV_DH    44
 #define SMK_PRIV_BAD   48
 #define SMK_PRIV_ASYNC 52
+#define SMK_PRIV_DEST_BYTES 56
 
 #define BUF_DEST  1096    /* SMACKBUF: puntatore al buffer di destinazione (storm_454/EFA0) */
 #define BUF_SIZE  4096
@@ -180,6 +181,26 @@ static int lib_load(void)
 
 static u32 *priv(void *o) { return (u32 *) ((u8 *) o + SMK_PRIV); }
 static u32 *bpriv(void *o) { return (u32 *) ((u8 *) o + BUF_PRIV); }
+typedef struct { void *pixels; u32 bytes; } smack_buffer_range;
+static smack_buffer_range g_buffer_ranges[32];
+static int buffer_range_add(void *pixels, u32 bytes) {
+    unsigned i;
+    for (i=0;i<sizeof g_buffer_ranges/sizeof g_buffer_ranges[0];++i)
+        if (!g_buffer_ranges[i].pixels) { g_buffer_ranges[i].pixels=pixels; g_buffer_ranges[i].bytes=bytes; return 1; }
+    return 0;
+}
+static u32 buffer_range_remove(void *pixels) {
+    unsigned i;
+    for (i=0;i<sizeof g_buffer_ranges/sizeof g_buffer_ranges[0];++i)
+        if (g_buffer_ranges[i].pixels==pixels) { u32 bytes=g_buffer_ranges[i].bytes; g_buffer_ranges[i].pixels=0; g_buffer_ranges[i].bytes=0; return bytes; }
+    return 0;
+}
+static u32 buffer_range_size(void *pixels) {
+    unsigned i;
+    for (i=0;i<sizeof g_buffer_ranges/sizeof g_buffer_ranges[0];++i)
+        if (g_buffer_ranges[i].pixels==pixels) return g_buffer_ranges[i].bytes;
+    return 0;
+}
 
 typedef struct {
     u8 *video;
@@ -541,8 +562,13 @@ static int copy_frame_data(u32 *o, const u8 *px)
     u8 *dest = (u8 *) (ulong) p[SMK_PRIV_DEST / 4];
     if (p[SMK_PRIV_BAD / 4]) return 0;
     if (!dest) return 1; /* decode without a registered destination is allowed */
-    if (!pitch || left > pitch || w > pitch - left || top >= dh || dh > 0xffffffffu / pitch) {
-        log2("[smack] destinazione fuori limiti: ", "frame non copiato"); return 0;
+    if (!pitch || left > pitch || w > pitch - left || top >= dh || dh > 0xffffffffu / pitch ||
+        (p[SMK_PRIV_DEST_BYTES / 4] && (ulong)pitch * dh > p[SMK_PRIV_DEST_BYTES / 4])) {
+        if (getenv("SC_SMACK_TRACE")) {
+            reasm_elf_log("[smack] destinazione fuori limiti: bytes/pitch/height=");
+            reasm_elf_log_hex(p[SMK_PRIV_DEST_BYTES / 4]); reasm_elf_log_hex(pitch); reasm_elf_log_hex(dh); reasm_elf_log("\\n");
+        }
+        return 0;
     }
     if (!px) return 0;
     rows = h < dh - top ? h : dh - top;
@@ -703,9 +729,13 @@ static u32 SMK_STDCALL SmackBufferOpen(u32 hwnd, u32 a2, u32 a3, u32 a4, u32 a5,
     if (!b) return 0;
     *(void **) ((u8 *) b + BUF_DEST) = calloc(1, bytes);
     if (!*(void **) ((u8 *) b + BUF_DEST)) { free(b); return 0; }
+    if (!buffer_range_add(*(void **) ((u8 *) b + BUF_DEST), bytes)) {
+        free(*(void **) ((u8 *) b + BUF_DEST)); free(b); return 0;
+    }
     bpriv(b)[0] = bytes; bpriv(b)[4] = a4;      /* dimensione, altezza (destheight) */
     b[16 / 4] = a3;                          /* pitch lu da storm 1502EFB6 */
-    reasm_elf_log("[smack] SmackBufferOpen: byte="); reasm_elf_log_hex(bytes); reasm_elf_log("\n");
+    reasm_elf_log("[smack] SmackBufferOpen: requested bytes="); reasm_elf_log_hex(bytes);
+    reasm_elf_log(" pitch="); reasm_elf_log_hex(a3); reasm_elf_log(" height="); reasm_elf_log_hex(a4); reasm_elf_log("\n");
     return (u32) (ulong) b;
 }
 
@@ -713,7 +743,10 @@ static u32 SMK_STDCALL SmackBufferClose(void *buf)
 {
     u32 *b = (u32 *) buf;
     if (!active() || !b) return 0;
-    if (*(void **) ((u8 *) b + BUF_DEST)) free(*(void **) ((u8 *) b + BUF_DEST));
+    if (*(void **) ((u8 *) b + BUF_DEST)) {
+        void *pixels=*(void **) ((u8 *) b + BUF_DEST);
+        (void)buffer_range_remove(pixels); free(pixels);
+    }
     free(b);
     return 1;
 }
@@ -739,7 +772,16 @@ static void SMK_STDCALL SmackToBuffer(void *smk, u32 left, u32 top, u32 pitch, u
     priv(o)[SMK_PRIV_PITCH / 4] = pitch;
     priv(o)[SMK_PRIV_TOP / 4] = top; priv(o)[SMK_PRIV_LEFT / 4] = left;
     priv(o)[SMK_PRIV_DH / 4] = destheight;
+    priv(o)[SMK_PRIV_DEST_BYTES / 4] = dest ? buffer_range_size(dest) : 0;
     priv(o)[SMK_PRIV_BAD / 4] = flags != 0 || !dest;
+    if (dest && !priv(o)[SMK_PRIV_DEST_BYTES / 4]) {
+        priv(o)[SMK_PRIV_BAD / 4] = 1;
+        log2("[smack] ToBuffer destinazione non registrata: ", "scrittura rifiutata");
+    } else if (dest && pitch && destheight && (ulong)pitch * destheight > priv(o)[SMK_PRIV_DEST_BYTES / 4]) {
+        priv(o)[SMK_PRIV_BAD / 4] = 1;
+        reasm_elf_log("[smack] ToBuffer fuori buffer: bytes/pitch/height=");
+        reasm_elf_log_hex(priv(o)[SMK_PRIV_DEST_BYTES / 4]); reasm_elf_log_hex(pitch); reasm_elf_log_hex(destheight); reasm_elf_log("\\n");
+    }
     if (getenv("SC_SMACK_TRACE")) {
         reasm_elf_log("[smack-trace] ToBuffer smk="); reasm_elf_log_hex((u32)(ulong)smk);
         reasm_elf_log(" frame/w/h="); reasm_elf_log_hex(o[SMK_CUR/4]);
