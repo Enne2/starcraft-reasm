@@ -495,7 +495,7 @@ S long s_Unlock(void *t, void *rect) {
     Surf *s = (Surf *) t;
     (void) rect;
     if (s->is_primary) sync_primary();
-    present(s);
+    present_tag(s, "unlock");
     return DD_OK;
 }
 S long s_UpdateOverlay(void *t, void *r, void *s, void *sr, u32 f, void *fx)

@@ -645,7 +645,6 @@ void storm_334_arm_body(_cpu *cpu) {
                        (descriptor_flags&0x04000000u)!=0,0,&src_span)) fail73("surface range",0,flags);
     {
         extern unsigned char *host_elf_canvas(int *, int *, int *);
-        extern volatile unsigned int g_canvas_write_ticks;
         int cw=0,ch=0,cp=0;
         unsigned char *canvas=host_elf_canvas(&cw,&ch,&cp);
         uint64_t canvas_lo=(uint32_t)(unsigned long)canvas;
@@ -747,6 +746,15 @@ void storm_334_arm_body(_cpu *cpu) {
               fail73("2x LUT surface span",0,flags);
           run_2x_lut(cpu,entry,p,rows,dst_delta,src_delta);
           if (writes_canvas) {
+              extern const void *smack_elf_buffer_owner(const void *) __attribute__((weak));
+              extern void host_elf_movie_present(const void *) __attribute__((weak));
+              /* Storm 0x1502F42A composites the full-screen movie from its
+               * SmackBuffer into the primary. Submit it here, before the next
+               * Storm clear. Offscreen/movie widgets use a different path. */
+              if (smack_elf_buffer_owner && host_elf_movie_present) {
+                  const void *movie = smack_elf_buffer_owner((const void *)(uintptr_t)src);
+                  if (movie) host_elf_movie_present(movie);
+              }
               extern volatile unsigned int g_canvas_write_ticks;
               __sync_add_and_fetch(&g_canvas_write_ticks,1u);
               ticked=1;

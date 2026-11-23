@@ -195,22 +195,28 @@ static u32 buffer_range_remove(void *pixels) {
         if (g_buffer_ranges[i].pixels==pixels) { u32 bytes=g_buffer_ranges[i].bytes; g_buffer_ranges[i].pixels=0; g_buffer_ranges[i].bytes=0; return bytes; }
     return 0;
 }
-/* storm passa a SmackToBuffer un puntatore che puo' stare DENTRO il buffer aperto da
- * SmackBufferOpen (dest = base + px0/dst0 del rettangolo, vedi log x86:
- * "dest=0x2055008C pitch=0xB8 rows=0x80 px0=0x2A dst0=0x2A"). Il confronto esatto faceva
- * fallire i film con rettangolo offset (briefing/campagna) marcandoli BAD: il frame veniva
- * scartato e il video restava nero. Qui si accetta ogni puntatore dentro un range noto e si
- * restituiscono i byte RESIDUI da quel puntatore, cosi' il controllo anti-overrun resta valido. */
-static u32 buffer_range_size(void *pixels) {
+/* Only SmackBufferOpen allocations belong here. In particular, do not cache a
+ * guest-owned destination: Storm can free and reuse that address between films.
+ * An interior pointer into an owned buffer has only the remaining capacity. */
+static const smack_buffer_range *buffer_range_find(const void *pixels) {
     unsigned i;
     uintptr_t p = (uintptr_t) pixels;
     for (i=0;i<sizeof g_buffer_ranges/sizeof g_buffer_ranges[0];++i) {
         uintptr_t base = (uintptr_t) g_buffer_ranges[i].pixels;
-        if (!base) continue;
-        if (p >= base && p - base < g_buffer_ranges[i].bytes)
-            return (u32) (g_buffer_ranges[i].bytes - (p - base));
+        if (base && p >= base && p - base < g_buffer_ranges[i].bytes)
+            return &g_buffer_ranges[i];
     }
     return 0;
+}
+
+const void *smack_elf_buffer_owner(const void *pixels) {
+    const smack_buffer_range *r = buffer_range_find(pixels);
+    return r ? r->pixels : 0;
+}
+
+static u32 buffer_range_size(const void *pixels) {
+    const smack_buffer_range *r = buffer_range_find(pixels);
+    return r ? r->bytes - (u32)((uintptr_t)pixels - (uintptr_t)r->pixels) : 0;
 }
 
 typedef struct {
@@ -573,8 +579,11 @@ static int copy_frame_data(u32 *o, const u8 *px)
     u8 *dest = (u8 *) (ulong) p[SMK_PRIV_DEST / 4];
     if (p[SMK_PRIV_BAD / 4]) return 0;
     if (!dest) return 1; /* decode without a registered destination is allowed */
-    if (!pitch || left > pitch || w > pitch - left || top >= dh || dh > 0xffffffffu / pitch ||
-        (p[SMK_PRIV_DEST_BYTES / 4] && (ulong)pitch * dh > p[SMK_PRIV_DEST_BYTES / 4])) {
+    if (!pitch || !w || !h || left > pitch || w > pitch - left || top >= dh ||
+        dh > UINT32_MAX / pitch) return 0;
+    rows = h < dh - top ? h : dh - top;
+    /* Validate the last byte actually written, not the padding after it. */
+    if ((top + rows - 1u) * pitch + left + w > p[SMK_PRIV_DEST_BYTES / 4]) {
         if (getenv("SC_SMACK_TRACE")) {
             reasm_elf_log("[smack] destinazione fuori limiti: bytes/pitch/height=");
             reasm_elf_log_hex(p[SMK_PRIV_DEST_BYTES / 4]); reasm_elf_log_hex(pitch); reasm_elf_log_hex(dh); reasm_elf_log("\\n");
@@ -582,7 +591,6 @@ static int copy_frame_data(u32 *o, const u8 *px)
         return 0;
     }
     if (!px) return 0;
-    rows = h < dh - top ? h : dh - top;
     for (y = 0; y < rows; ++y)
         memcpy(dest + (ulong) (top + y) * pitch + left, px + (ulong) y * w, w);
     return 1;
@@ -756,6 +764,8 @@ static u32 SMK_STDCALL SmackBufferClose(void *buf)
     if (!active() || !b) return 0;
     if (*(void **) ((u8 *) b + BUF_DEST)) {
         void *pixels=*(void **) ((u8 *) b + BUF_DEST);
+        extern void host_elf_movie_end(const void *) __attribute__((weak));
+        if (host_elf_movie_end) host_elf_movie_end(pixels);
         (void)buffer_range_remove(pixels); free(pixels);
     }
     free(b);
@@ -778,7 +788,6 @@ static void SMK_STDCALL SmackToBuffer(void *smk, u32 left, u32 top, u32 pitch, u
     u32 *o = (u32 *) smk;
     const u8 *px;
     u32 rows;
-    static u32 c_autoreg;
     if (!active() || !o) return;
     priv(o)[SMK_PRIV_DEST / 4] = (u32) (ulong) dest;
     priv(o)[SMK_PRIV_PITCH / 4] = pitch;
@@ -787,31 +796,13 @@ static void SMK_STDCALL SmackToBuffer(void *smk, u32 left, u32 top, u32 pitch, u
     priv(o)[SMK_PRIV_DEST_BYTES / 4] = dest ? buffer_range_size(dest) : 0;
     priv(o)[SMK_PRIV_BAD / 4] = flags != 0 || !dest;
     if (dest && !priv(o)[SMK_PRIV_DEST_BYTES / 4]) {
-        /* Destinazione non aperta da SmackBufferOpen: storm/gioco possono passare un buffer proprio
-         * (o un buffer gia' chiuso e riusato). Rifiutarla significa NON scrivere alcun frame e
-         * mostrare il video nero: la si registra qui (col limite dichiarato dal chiamante) e la
-         * validazione anti-overrun resta attiva sui byte dichiarati. */
-        ulong need = (ulong) pitch * destheight;
-        if (pitch && destheight && need && need <= 640ul * 480ul * 2ul &&
-            buffer_range_add(dest, (u32) need)) {
-            priv(o)[SMK_PRIV_DEST_BYTES / 4] = (u32) need;
-            if (c_autoreg++ < 2) {
-                reasm_elf_log("[smack] ToBuffer destinazione registrata al volo: ");
-                reasm_elf_log_hex((u32) (ulong) dest); reasm_elf_log(" byte=");
-                reasm_elf_log_hex((u32) need); reasm_elf_log("\n");
-            }
-        } else {
+        /* Caller-owned surface: pitch and height are the SmackToBuffer contract.
+         * Its bounds belong to THIS binding, not to the global owned-buffer table. */
+        if (pitch && destheight && destheight <= UINT32_MAX / pitch &&
+            pitch * destheight <= UINTPTR_MAX - (uintptr_t)dest)
+            priv(o)[SMK_PRIV_DEST_BYTES / 4] = pitch * destheight;
+        else
             priv(o)[SMK_PRIV_BAD / 4] = 1;
-            reasm_elf_log("[smack] ToBuffer destinazione rifiutata: ");
-            reasm_elf_log_hex((u32) (ulong) dest); reasm_elf_log(" pitch=");
-            reasm_elf_log_hex(pitch); reasm_elf_log(" dh="); reasm_elf_log_hex(destheight);
-            reasm_elf_log("\n");
-        }
-    }
-    if (dest && pitch && destheight && (ulong)pitch * destheight > priv(o)[SMK_PRIV_DEST_BYTES / 4]) {
-        priv(o)[SMK_PRIV_BAD / 4] = 1;
-        reasm_elf_log("[smack] ToBuffer fuori buffer: bytes/pitch/height=");
-        reasm_elf_log_hex(priv(o)[SMK_PRIV_DEST_BYTES / 4]); reasm_elf_log_hex(pitch); reasm_elf_log_hex(destheight); reasm_elf_log("\\n");
     }
     if (getenv("SC_SMACK_TRACE")) {
         reasm_elf_log("[smack-trace] ToBuffer smk="); reasm_elf_log_hex((u32)(ulong)smk);

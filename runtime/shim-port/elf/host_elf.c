@@ -20,6 +20,9 @@
 #if defined(__arm__)
 #include <signal.h>
 #include <ucontext.h>
+#include <linux/fb.h>           /* present su framebuffer: struct e ioctl FBIOGET_*. Nota
+                                 * "libc dinamica" sotto: niente header libc, quindi mmap/ioctl/
+                                 * open sono dichiarati a mano; linux/fb.h non li ridefinisce. */
 #endif
 
 /* ---- libc dinamica (niente header: si resta freestanding) ---- */
@@ -43,6 +46,13 @@ extern int munmap(void *, unsigned long);
 extern int mprotect(void *, unsigned long, int);
 extern void _exit(int);
 #endif
+extern int ioctl(int, unsigned long, ...);     /* present su /dev/fb0 */
+extern int setenv(const char *, const char *, int);
+#if !defined(O_RDWR)
+#define O_RDWR 2                               /* libc dinamica: nessun <fcntl.h> */
+#endif
+#define FB_PROT_RW 3                           /* PROT_READ|PROT_WRITE (nessun <sys/mman.h>) */
+#define FB_MAP_SHARED 0x01                     /* MAP_SHARED */
 extern void win32_input_pump(void) __attribute__((weak));
 
 /* ---- API SDL2 usate (verificate con `nm -D` su /lib/libSDL2-2.0.so.0) ---- */
@@ -164,6 +174,26 @@ void host_elf_present_reason(const char *r) { g_present_reason = r ? r : "?"; }
  * NON attende mai il pacing. Un `Blt` non deve bloccare il thread di gioco: con l'attesa il
  * thread che riempie i buffer audio restava indietro e il suono andava in loop. */
 void host_elf_present(void);
+static void host_present_frame(int movie);
+static const void *g_movie_buffer;
+static int g_present_force = 1;
+
+/* Storm's full-screen movie path composites directly into the primary.
+ * Keep the last committed movie frame visible through intermediate clears. */
+void host_elf_movie_present(const void *buffer) {
+    if (!buffer || !host_elf_input_owner()) return;
+    g_movie_buffer = buffer;
+    host_present_frame(1);
+}
+
+void host_elf_movie_end(const void *buffer) {
+    if (buffer && g_movie_buffer == buffer) {
+        g_movie_buffer = 0;
+        g_present_force = 1;
+    }
+}
+
+static int fb_present_requested(void);   /* SC_PRESENT=fb: present su /dev/fb0 */
 static int g_present_nowait;
 int host_elf_present_coalesced(void) {
     static unsigned int last;
@@ -386,7 +416,7 @@ static unsigned char *g_present_snapshot;
 static unsigned long g_present_snapshot_size;
 static unsigned int g_presented_at;
 static unsigned int g_present_palette[256];
-static int g_present_snapshot_valid, g_present_force = 1;
+static int g_present_snapshot_valid;
 static int g_pal_set;                /* 0 = nessuna palette impostata (default: scala di grigi) */
 static int g_sc_ctl_initialized;
 static unsigned int g_map[256];      /* palette -> pixel nel formato della finestra */
@@ -431,6 +461,10 @@ int host_elf_init(const char *title) {
     g_presented_at = 0;
     { int i; for (i = 0; i < 256; ++i) g_pal[i] = (unsigned int) (i * 0x010101u); }
     if (g_inited) return 0;
+    /* SC_PRESENT=fb: il frame va nel framebuffer, non in una finestra. Serve comunque un
+     * driver video SDL per la finestra/surface "fantasma" usata da input, mouse e pump:
+     * 'dummy' non richiede alcun server. Va forzato PRIMA di SDL_Init. */
+    if (fb_present_requested()) { SDL_SetHint("SDL_VIDEODRIVER", "dummy"); setenv("SDL_VIDEODRIVER", "dummy", 1); }
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         g_err = SDL_GetError();
         reasm_elf_log("[host] SDL_Init fallita: ");
@@ -1252,10 +1286,138 @@ static void present_snapshot_commit(unsigned int now) {
     sc_ctl_frame_presented(g_pal_set);
 }
 
-void host_elf_present(void) {
+/* ---- present diretto su framebuffer Linux (/dev/fb0) --------------------------------
+ * SC_PRESENT=fb: nessun server video e nessun DRM. Serve dove esiste SOLO il framebuffer:
+ * Raspberry Pi con fbdev (bcm2708_fb) e QEMU -M raspi0 (BCM2708 FB). Su questi target
+ * libSDL2 di Raspberry Pi OS non ha ne' fbcon ne' kmsdrm, quindi senza X11 non esiste
+ * alcun percorso SDL per mostrare il frame: qui si scrive nel framebuffer mappato.
+ * Il canvas resta 8 bit indicizzato: si applica la palette e si scala nearest-neighbour
+ * con due mappe precalcolate (una divisione per colonna/riga, non per pixel).
+ * Diagnostica: [fb] una riga all'apertura. Override device: SC_FB_DEV=/dev/fb1.
+ */
+static int fb_present_requested(void)
+{
+    const char *m = getenv("SC_PRESENT");
+    return m && m[0] == 'f' && m[1] == 'b';
+}
+
+#if defined(__arm__)
+static int fb_fd = -1;
+static int fb_state;                       /* 0 = non tentato, 1 = pronto, -1 = fallito */
+static unsigned char *fb_mem;
+static unsigned long fb_mem_len;
+static unsigned int fb_xres, fb_yres, fb_bpp, fb_line;
+static unsigned int fb_dx, fb_dy, fb_dw, fb_dh;   /* finestra 4:3 dentro il pannello */
+static unsigned int fb_xmap[4096];                /* colonna dst -> colonna src in 16.16 */
+static unsigned int fb_ymap[4096];                /* riga dst   -> riga src   in 16.16 */
+static unsigned int fb_src_w, fb_src_h;           /* canvas a cui le mappe si riferiscono */
+
+static void fb_put(const char *s) { reasm_elf_log(s); }
+static void fb_putn(unsigned int v)
+{
+    char b[11]; int i = 10;
+    b[10] = 0;
+    do { b[--i] = (char)('0' + (v % 10u)); v /= 10u; } while (v && i > 0);
+    fb_put(b + i);
+}
+
+/* Riempe di nero le bande (letterbox) e tutto il pannello la prima volta. */
+static void fb_clear(void)
+{
+    if (!fb_mem) return;
+    memset(fb_mem, 0, fb_mem_len);
+}
+
+static int fb_open(void)
+{
+    struct fb_fix_screeninfo fx;
+    struct fb_var_screeninfo vx;
+    const char *dev = getenv("SC_FB_DEV");
+    if (fb_state) return fb_state > 0 ? 0 : -1;
+    if (!dev || !*dev) dev = "/dev/fb0";
+    fb_fd = open(dev, O_RDWR);
+    if (fb_fd < 0) { fb_state = -1; fb_put("[fb] open fallita: "); fb_put(dev); fb_put("\n"); return -1; }
+    if (ioctl(fb_fd, FBIOGET_FSCREENINFO, &fx) != 0 || ioctl(fb_fd, FBIOGET_VSCREENINFO, &vx) != 0) {
+        fb_state = -1; fb_put("[fb] ioctl FBIOGET_* fallita\n"); close(fb_fd); fb_fd = -1; return -1;
+    }
+    fb_xres = vx.xres; fb_yres = vx.yres; fb_bpp = vx.bits_per_pixel; fb_line = fx.line_length;
+    if ((fb_bpp != 32 && fb_bpp != 16) || fb_xres == 0 || fb_yres == 0 || fb_line == 0) {
+        fb_state = -1; fb_put("[fb] formato non supportato: bpp="); fb_putn(fb_bpp);
+        fb_put(" w="); fb_putn(fb_xres); fb_put(" line="); fb_putn(fb_line); fb_put("\n");
+        close(fb_fd); fb_fd = -1; return -1;
+    }
+    fb_mem_len = (unsigned long) fb_line * (unsigned long) fb_yres;
+    fb_mem = (unsigned char *) mmap(0, fb_mem_len, FB_PROT_RW, FB_MAP_SHARED, fb_fd, 0);
+    if (fb_mem == (unsigned char *) -1) {
+        fb_mem = 0; fb_state = -1;
+        fb_put("[fb] mmap fallita (len="); fb_putn((unsigned int) fb_mem_len); fb_put(")\n");
+        close(fb_fd); fb_fd = -1; return -1;
+    }
+    /* area 4:3 centrata nel pannello (stessa regola del present SDL) */
+    if ((unsigned long) fb_xres * 3ul >= (unsigned long) fb_yres * 4ul) {
+        fb_dh = fb_yres; fb_dw = fb_yres * 4u / 3u;
+    } else {
+        fb_dw = fb_xres; fb_dh = fb_xres * 3u / 4u;
+    }
+    if (fb_dw > 4096u) fb_dw = 4096u;
+    if (fb_dh > 4096u) fb_dh = 4096u;
+    fb_dx = (fb_xres - fb_dw) / 2u;
+    fb_dy = (fb_yres - fb_dh) / 2u;
+    fb_src_w = 0; fb_src_h = 0;
+    fb_clear();
+    fb_state = 1;
+    fb_put("[fb] present su "); fb_put(dev); fb_put(" ");
+    fb_putn(fb_xres); fb_put("x"); fb_putn(fb_yres); fb_put("x"); fb_putn(fb_bpp);
+    fb_put(" stride="); fb_putn(fb_line);
+    fb_put(" area="); fb_putn(fb_dw); fb_put("x"); fb_putn(fb_dh);
+    fb_put(" offset="); fb_putn(fb_dx); fb_put(","); fb_putn(fb_dy); fb_put("\n");
+    return 0;
+}
+
+static void fb_build_maps(void)
+{
+    unsigned int i;
+    if (fb_src_w == (unsigned int) g_w && fb_src_h == (unsigned int) g_h) return;
+    for (i = 0; i < fb_dw && i < 4096u; ++i)
+        fb_xmap[i] = (unsigned int) (((unsigned long) i * (unsigned long) g_w << 16) / fb_dw);
+    for (i = 0; i < fb_dh && i < 4096u; ++i)
+        fb_ymap[i] = (unsigned int) (((unsigned long) i * (unsigned long) g_h << 16) / fb_dh);
+    fb_src_w = (unsigned int) g_w; fb_src_h = (unsigned int) g_h;
+}
+
+static void fb_draw(void)
+{
+    unsigned int i, j, c;
+    fb_build_maps();
+    for (j = 0; j < fb_dh; ++j) {
+        const unsigned char *src = g_canvas + (unsigned long) (fb_ymap[j] >> 16) * (unsigned long) g_pitch;
+        unsigned char *drow = fb_mem + (unsigned long) (fb_dy + j) * (unsigned long) fb_line;
+        if (fb_bpp == 32) {
+            unsigned int *p = (unsigned int *) (drow + (unsigned long) fb_dx * 4ul);
+            for (i = 0; i < fb_dw; ++i) { c = g_pal[src[fb_xmap[i] >> 16]]; p[i] = c & 0x00FFFFFFu; }
+        } else {
+            unsigned short *p = (unsigned short *) (drow + (unsigned long) fb_dx * 2ul);
+            for (i = 0; i < fb_dw; ++i) {
+                unsigned int r, g, b;
+                c = g_pal[src[fb_xmap[i] >> 16]];
+                r = (c >> 16) & 0xFFu; g = (c >> 8) & 0xFFu; b = c & 0xFFu;
+                p[i] = (unsigned short) (((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+            }
+        }
+    }
+}
+#endif  /* __arm__ */
+
+void host_elf_present(void) { host_present_frame(0); }
+
+static void host_present_frame(int movie) {
     SDL_Surface *ws;
     unsigned int now, cap;
     if (!g_win || !g_canvas) return;
+    if (!movie && g_movie_buffer) {
+        if (host_elf_input_owner() && win32_input_pump) win32_input_pump();
+        return;
+    }
     /* Diagnostica del "video nero": il canvas contiene il frame al momento del blit (misurato dal
      * lato SCode) ma qui puo' arrivare azzerato o con una palette nera. SC_PRESENT_DBG=1 stampa
      * indici non-zero, indice massimo e voci di palette non nere ogni 30 present. */
@@ -1273,10 +1435,10 @@ void host_elf_present(void) {
                 for (x = 0; x < (unsigned int) g_w; ++x)
                     if (g_canvas[(unsigned long)y * (unsigned int)g_pitch + x]) ++nz_film;
             for (i = 0; i < 256u; ++i) if (g_pal[i] & 0x00FFFFFFu) ++pal_nz;
-            if (!nz || (tick % 10u) == 0u) {
+            if (movie || !nz || (tick % 10u) == 0u) {
             reasm_elf_log(nz ? "[present-seq] tick=" : "[present-black] tick="); reasm_elf_log_hex(tick);
             reasm_elf_log(" nz="); reasm_elf_log_hex(nz);
-            reasm_elf_log(" why="); reasm_elf_log(g_present_reason);
+            reasm_elf_log(" why="); reasm_elf_log(movie ? "movie" : g_present_reason);
             reasm_elf_log(" h="); reasm_elf_log_hex(hsh >> 8);
             reasm_elf_log("\n");
             }
@@ -1299,10 +1461,12 @@ void host_elf_present(void) {
     /* Il server non legge mai il canvas: la richiesta viene copiata qui, nel thread proprietario. */
     sc_ctl_present(g_canvas, g_w, g_h, g_pitch, g_pal);
     /* Input/pump resta sempre non-throttled anche quando si deduplica o si limita il present. */
-    if (host_elf_input_owner() && win32_input_pump) win32_input_pump();
+    if (!movie && host_elf_input_owner() && win32_input_pump) win32_input_pump();
     now = SDL_GetTicks();
-    if (present_is_duplicate(now)) return;
-    cap = present_fps_cap();
+    if (!movie && present_is_duplicate(now)) return;
+    /* SmackWait already paces this stream; the host cap could discard the only
+     * complete state before Storm clears the primary for its next operation. */
+    cap = movie ? 0 : present_fps_cap();
     if (cap && g_present_snapshot_valid && now - g_presented_at < 1000u / cap) {
         /* Pacing reale: il gioco chiama present in un loop stretto (spins) finche' il frame non e' dovuto.
          * Dormire il tempo residuo invece di bruciare CPU replica il blocco del Blt con vsync originale;
@@ -1330,6 +1494,14 @@ void host_elf_present(void) {
         } else {
             return;
         }
+    }
+    if (fb_present_requested()) {
+#if defined(__arm__)
+        if (fb_open() == 0) { fb_draw(); present_snapshot_commit(SDL_GetTicks()); return; }
+        reasm_elf_log("[host] present: framebuffer non disponibile, torno al percorso SDL\n");
+#else
+        reasm_elf_log("[host] present: SC_PRESENT=fb non supportato su questa piattaforma\n");
+#endif
     }
     {   /* gl -> gpu -> cpu; gpu/cpu permettono A/B esplicito. */
         const char *mode = getenv("SC_PRESENT");
