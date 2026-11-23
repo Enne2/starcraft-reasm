@@ -7,7 +7,7 @@
  *
  * Criterio: qui finisce solo cio' che non ha ne' uno shim C con prototipo (il generatore ne
  * ricava l'arita') ne' un'implementazione fedele possibile nel modello ARM. Le API che possono
- * essere implementate davvero stanno in runtime/arm/win32_ext_arm.c.
+ * essere implementate davvero stanno in runtime/arm/win32_ext.c.
  */
 
 /* __fpmath NON e' qui: e' definito come simbolo assoluto 0 in guest_abs_zero.S, cosi' la CRT

@@ -1,4 +1,4 @@
-/* runtime/arm/bridge_arm.h — import bridge: from SRW/LLASM import symbols to ARM code.
+/* runtime/arm/bridge.h — import bridge: from SRW/LLASM import symbols to ARM code.
  *
  * Naming follows the emitter exactly (`SRW/SR_output.c:SR_write_output_import`): for LLASM
  * output every used import becomes `proc <ProcName> external`, where <ProcName> is

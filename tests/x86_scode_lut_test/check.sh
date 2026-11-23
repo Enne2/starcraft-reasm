@@ -6,7 +6,7 @@ mkdir -p "$OUT"
 cd "$ROOT"
 COMMON=(-std=c11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections
         -I runtime/common -I runtime/shim-port/elf
-        tests/x86_scode_lut_test/test_scode_lut.c runtime/common/game_memory_arm.c
+        tests/x86_scode_lut_test/test_scode_lut.c runtime/common/game_memory.c
         -Wl,--gc-sections)
 
 gcc -m32 "${COMMON[@]}" -o "$OUT/test_scode_lut_32"

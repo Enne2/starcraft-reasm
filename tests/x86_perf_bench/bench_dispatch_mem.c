@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include "../../runtime/common/indirect_dispatch.h"
-#include "../../runtime/common/game_memory_arm.h"
+#include "../../runtime/common/game_memory.h"
 #include "../../runtime/common/cpu_llasm.h"
 #include <stdint.h>
 #include <stdio.h>

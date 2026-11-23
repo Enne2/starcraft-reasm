@@ -24,7 +24,7 @@
  */
 #include "indirect_dispatch.h"
 #include "cpu_llasm.h"
-#include "game_memory_arm.h"
+#include "game_memory.h"
 
 #include <stdint.h>
 #include <stdio.h>

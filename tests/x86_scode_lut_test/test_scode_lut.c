@@ -8,7 +8,7 @@
 #if UINTPTR_MAX > UINT32_MAX
 #define _Static_assert(condition,message)
 #endif
-#include "../../runtime/common/storm_sdraw_arm.c"
+#include "../../runtime/common/storm_sdraw.c"
 #if UINTPTR_MAX > UINT32_MAX
 #undef _Static_assert
 #endif

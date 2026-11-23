@@ -302,7 +302,7 @@ if [[ "$MODE" != runtime ]]; then
 fi
 
 # =============================================================================================
-# Runtime del port: si ricompilano dai sorgenti attuali (game_main_arm.c chiama
+# Runtime del port: si ricompilano dai sorgenti attuali (game_main.c chiama
 # reasm_dispatch_init, indirect_dispatch.[cS] sono nuovi). Gli oggetti *generati* dagli script
 # (bridge stubs, tabella degli import, ordinali storm, shim) restano quelli di
 # tools/build-runtime-arm.sh stage 7: vengono copiati, non rigenerati qui.
@@ -350,9 +350,9 @@ fi
 
 # runtime C/S del port: chiave = sorgenti + header (un header toccato ricompila tutto: è la
 # scelta sicura), condivisa da tutti i TU. Ogni file ha il proprio artefatto in cache.
-RT_FILES=(cpu_llasm.c game_memory_arm.c x86_helpers.c bridge_arm.c elf_support_arm.c
-          x87_crt_arm.c crt_init_arm.c guest_call_arm.c win32_ext_arm.c game_main_arm.c
-          com_bridge_arm.c storm_sdraw_arm.c)
+RT_FILES=(cpu_llasm.c game_memory.c guest_cpu_helpers.c bridge.c elf_support.c
+          x87_crt.c crt_init.c guest_call.c win32_ext.c game_main.c
+          com_bridge.c storm_sdraw.c)
 RT_HDRS=("$ROOT"/runtime/common/*.h "$GEN_DIR"/guest_layout_arm.h)
 # Chiave per singolo TU: il suo sorgente + TUTTI gli header del runtime. Un header toccato
 # ricompila tutto (sicuro), un .c toccato ricompila solo il suo oggetto.
@@ -375,7 +375,7 @@ done
 # coppie "sorgente in runtime/common -> oggetto": la dispatch vive accanto alle immagini (IMG_OBJS
 # del link), tls_arm.o con il resto del runtime (RUNTIME_OBJ_DIR).
 for pair in "arch/arm/tls.S runtime/tls_arm.o" "common/indirect_dispatch.c indirect_dispatch.o" \
-            "arch/arm/indirect_dispatch.S indirect_dispatch_asm.o" "arch/arm/com_bridge.S runtime/com_bridge_arm_asm.o"; do
+            "arch/arm/indirect_dispatch.S indirect_dispatch_asm.o" "arch/arm/com_bridge.S runtime/com_bridge_asm.o"; do
   set -- $pair
   src="$ROOT/runtime/$1"; o="$P/$2"; k=$(key_of "runtime v2 ${CC_ARM[*]} $1" "$src" "${RT_HDRS[@]}")
   if (( ! NO_CACHE )) && [[ -s "$CACHE/$(basename "$o").$k" ]]; then

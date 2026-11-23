@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-/* runtime/arm/guest_call_arm.c — calling *guest* procedures from C shims (the callback direction).
+/* runtime/arm/guest_call.c — calling *guest* procedures from C shims (the callback direction).
  *
  * The sc-reasm shims were written for the i386 ELF runtime, where the game's code *is* native code
  * at its VA: `win32_ui.c` calls a window procedure with
@@ -20,7 +20,7 @@
  * accumulate.
  */
 #include "cpu_llasm.h"
-#include "game_memory_arm.h"
+#include "game_memory.h"
 #include "indirect_dispatch.h"
 #include "thread_affinity.h"
 

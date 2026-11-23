@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include "game_memory_arm.h"
+#include "game_memory.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/mman.h>

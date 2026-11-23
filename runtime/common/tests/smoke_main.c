@@ -17,10 +17,10 @@
  *      pixel writes with the dummy video driver.
  */
 #include "cpu_llasm.h"
-#include "game_memory_arm.h"
-#include "x86_helpers.h"
-#include "bridge_arm.h"
-#include "elf_support_arm.h"
+#include "game_memory.h"
+#include "guest_cpu_helpers.h"
+#include "bridge.h"
+#include "elf_support.h"
 
 #include <SDL2/SDL.h>
 

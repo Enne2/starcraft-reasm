@@ -1,4 +1,4 @@
-/* runtime/arm/x86_helpers.c — implementation of the seams declared in x86_helpers.h.
+/* runtime/arm/guest_cpu_helpers.c — implementation of the seams declared in guest_cpu_helpers.h.
  *
  * Everything i386-specific that the sc-reasm shims did with inline asm now goes through these
  * functions, so the C shims themselves stay portable:
@@ -6,8 +6,8 @@
  *   movl %fs:0x34 / movl %0,%fs:0x34 -> x86_read_fs_dword / x86_write_fs_dword (LLASM helpers)
  *   %fs based TEB                 -> an emulated TEB page in low guest memory
  */
-#include "x86_helpers.h"
-#include "game_memory_arm.h"
+#include "guest_cpu_helpers.h"
+#include "game_memory.h"
 
 #include <stdint.h>
 #include <string.h>

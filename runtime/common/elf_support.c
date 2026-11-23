@@ -1,18 +1,18 @@
-/* runtime/arm/elf_support_arm.c — logs, module/proc lookup and loader hooks for the ARM runtime.
+/* runtime/arm/elf_support.c — logs, module/proc lookup and loader hooks for the ARM runtime.
  *
  * Ported from ~/dev/reasm-toolkit/runtime/elf/{elf_support.c,teb.c}. Both originals are part of
  * the x86 ELF runtime: elf_support.c is already architecture-neutral C (only write(2)/strlen),
  * teb.c is not (set_thread_area, %fs). So the log half is a straight port and the TEB half is
- * re-implemented on top of the emulated TEB from x86_helpers.c.
+ * re-implemented on top of the emulated TEB from guest_cpu_helpers.c.
  *
  * Deliberate behaviour kept from the toolkit:
  *  - never a stub that returns for an unimplemented import (rule D19): log + _exit(3);
  *  - loader_init() with no PE header table logs and returns instead of pretending success.
  */
-#include "elf_support_arm.h"
-#include "bridge_arm.h"
-#include "game_memory_arm.h"
-#include "x86_helpers.h"
+#include "elf_support.h"
+#include "bridge.h"
+#include "game_memory.h"
+#include "guest_cpu_helpers.h"
 
 #include <stdint.h>
 #include <string.h>

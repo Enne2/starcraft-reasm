@@ -5,7 +5,7 @@
 ;   * x87 software FPU                  (fld_double, fmul_double, fstp_double) -> llasm_float.c
 ;   * string ops                        (rep movsd, repe cmpsb)     -> llasm_movs.c / llasm_cmps.c
 ;   * fs:[0x34] (LastError)             (x86_read/write_fs_dword)   -> emulated TEB, no %fs
-;   * an imported function with stdcall semantics (armtest_probe)  -> bridge_arm.c + stubs
+;   * an imported function with stdcall semantics (armtest_probe)  -> bridge.c + stubs
 ;
 ; Results are written to fixed guest addresses (0x00401000..) that the C harness inspects.
 ; Guest memory is mapped at the original image VAs, so absolute immediates are guest VAs.

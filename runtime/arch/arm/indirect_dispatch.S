@@ -105,7 +105,7 @@ reasm_extern:
 	b	.
 	.size	reasm_extern, . - reasm_extern
 
-/*  ___sse2_available_init (VA guest 0x004F8329) — corpo in runtime/arm/crt_init_arm.c.
+/*  ___sse2_available_init (VA guest 0x004F8329) — corpo in runtime/arm/crt_init.c.
  *  Il VA e' nella tabella della dispatch (`--map-extra 0x4F8329=__sse2_available_init`), quindi la
  *  procedura si raggiunge con un salto: questo ingresso la rende indistinguibile da una tradotta.
  */
@@ -119,7 +119,7 @@ __sse2_available_init:
 	.word	__sse2_available_init_body
 	.size	__sse2_available_init, . - __sse2_available_init
 
-/*  ___sse2_available_init di storm.dll (VA guest 0x15040E07) — corpo in crt_init_arm.c.
+/*  ___sse2_available_init di storm.dll (VA guest 0x15040E07) — corpo in crt_init.c.
  *  Voce 0x15059100 della tabella inizializzatori del CRT di storm (0x150590F0..0x15059104).
  */
 	.global	__sse2_available_init_storm

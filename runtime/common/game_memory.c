@@ -1,6 +1,6 @@
-/* runtime/arm/game_memory_arm.c — fixed-VA guest mappings and the low arena (ARMv6 Linux).
+/* runtime/arm/game_memory.c — fixed-VA guest mappings and the low arena (ARMv6 Linux).
  *
- * See game_memory_arm.h for the "why". Implementation notes worth keeping:
+ * See game_memory.h for the "why". Implementation notes worth keeping:
  *  - MAP_FIXED is the only portable way to obtain an exact VA on 32-bit ARM Linux. It silently
  *    replaces an existing mapping, so every call is followed by a pointer check: a mismatch is
  *    reported, never ignored (a wrong VA turns into corrupted guest state much later).
@@ -10,8 +10,8 @@
  *  - No MAP_32BIT: that flag exists only on x86_64. On ARMv6 the address space *is* 32-bit; the
  *    problem is not reachability but the 0x80000000 sign convention (see arm_selftest_low).
  */
-#include "game_memory_arm.h"
-#include "x86_helpers.h"
+#include "game_memory.h"
+#include "guest_cpu_helpers.h"
 
 #include <stdint.h>
 #include <string.h>

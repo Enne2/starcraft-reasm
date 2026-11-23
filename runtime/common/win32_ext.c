@@ -1,4 +1,4 @@
-/* runtime/arm/win32_ext_arm.c — the few Win32 APIs the game imports that the sc-reasm shims do
+/* runtime/arm/win32_ext.c — the few Win32 APIs the game imports that the sc-reasm shims do
  * not implement, and that can be implemented *faithfully* on the ARM runtime.
  *
  * Only two groups qualify; everything else stays a declared UNK trampoline (see
@@ -17,8 +17,8 @@
  *    host, so this is the real behaviour of the API here, and each of them is logged once so the
  *    choice is visible in the trace instead of being silent.
  */
-#include "x86_helpers.h"
-#include "game_memory_arm.h"
+#include "guest_cpu_helpers.h"
+#include "game_memory.h"
 
 #include <stdint.h>
 #include <string.h>

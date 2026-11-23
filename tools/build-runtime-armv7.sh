@@ -64,15 +64,15 @@ for f in "$SR"/llasm_*.c; do
   [[ "$(basename "$f")" == llasm_cmps.c ]] && f="$RT/llasm_cmps.c"
   "${CC[@]}" "${CFLAGS[@]}" -I "$SR" -c -o "$OBJ/$(basename "${f%.c}").o" "$f"
 done
-for f in cpu_llasm.c game_memory_arm.c x86_helpers.c bridge_arm.c elf_support_arm.c \
-         x87_crt_arm.c crt_init_arm.c guest_call_arm.c win32_ext_arm.c storm_scomp.c \
-         storm_sdraw_arm.c com_bridge_arm.c indirect_dispatch.c; do
+for f in cpu_llasm.c game_memory.c guest_cpu_helpers.c bridge.c elf_support.c \
+         x87_crt.c crt_init.c guest_call.c win32_ext.c storm_scomp.c \
+         storm_sdraw.c com_bridge.c indirect_dispatch.c; do
   "${CC[@]}" "${CFLAGS[@]}" -I "$RT" -I "$G" -c -o "$OBJ/${f%.c}.o" "$RT/$f"
 done
 for f in indirect_dispatch.S com_bridge.S tls.S guest_abs_zero.S; do
   "${CC[@]}" -c -o "$OBJ/${f%.S}_asm.o" "$ARM/$f"
 done
-"${CC[@]}" "${CFLAGS[@]}" -I "$RT" -I "$G" -c -o "$OBJ/game_main_arm.o" "$RT/game_main_arm.c"
+"${CC[@]}" "${CFLAGS[@]}" -I "$RT" -I "$G" -c -o "$OBJ/game_main.o" "$RT/game_main.c"
 "${CC[@]}" "${CFLAGS[@]}" -I "$RT" -I "$G" -c -o "$OBJ/pe_headers_arm.o" "$G/pe_headers_arm.c"
 
 # ---- 3) cosa manca al link: riferimenti dei due oggetti meno definiti -------------------

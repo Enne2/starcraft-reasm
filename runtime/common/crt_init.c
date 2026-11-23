@@ -1,4 +1,4 @@
-/* runtime/arm/crt_init_arm.c — procedure CRT che il lift non puo' tradurre, con semantica provata.
+/* runtime/arm/crt_init.c — procedure CRT che il lift non puo' tradurre, con semantica provata.
  *
  * `___sse2_available_init` (StarCraft.exe VA 0x004F8329, IDA: decompilata per intero)
  * ---------------------------------------------------------------------------------
@@ -6,7 +6,7 @@
  * interrogato il bit ID di EFLAGS. Ne' SRW (`vendor/sr/SRW/udis86_dep.c` non ha `cpuid` nella
  * tabella delle flag) ne' `llasm` hanno un caso per `cpuid`: dichiararla in
  * `build/lift-full/external_procedures.sci` e' il meccanismo previsto dalla pipeline per le
- * procedure che il traduttore non copre (stesso trattamento di `__CIpow`, vedi x87_crt_arm.c).
+ * procedure che il traduttore non copre (stesso trattamento di `__CIpow`, vedi x87_crt.c).
  *
  * Semantica dall'oracolo (IDA 0x4F8329-0x4F83E9, letta per intero):
  *   v0 = EFLAGS; EFLAGS ^= 0x200000 (bit ID); v2 = EFLAGS; EFLAGS = v0

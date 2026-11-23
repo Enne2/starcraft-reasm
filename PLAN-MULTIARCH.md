@@ -33,7 +33,7 @@ Nota: `CHECKPOINT.md` (20 nov 16:46) è un documento intermedio superato dai rep
   - Codice ricompilato del port spostato a `IMG_BASE=0x18000000` (`--section-start=.text=0x18000000`), disgiunto da tutte le aree dati guest.
 - **Runtime e Shim SDL2 (`runtime/arm/` + `runtime/shim-port/elf/`):**
   - `menu8` su hardware ARM reale (Pinebook Pro RK3399, compat AArch32) supera il CRT, carica gli MPQ, apre finestra SDL2/X11 e audio PulseAudio, **visualizza e anima il menu principale** (`Single Player`, `Multiplayer`, `Campaign Editor`, `Exit`) con `libsmacker` e tocca ~173–207 FPS prima di fermarsi su `[arm-dispatch] STOP: target = 0x0041CAC8` (collocato da IDA a metà istruzione a `0x0041CAC6`, probabile callback/residui di chiusura).
-  - `runtime/arm/storm_sdraw_arm.c` contiene un interprete fail-closed per i kernel `SCode` x86 generati da Storm a runtime e il percorso row-by-row per ROP `0xCC0020` / `0xF00021`.
+  - `runtime/arm/storm_sdraw.c` contiene un interprete fail-closed per i kernel `SCode` x86 generati da Storm a runtime e il percorso row-by-row per ROP `0xCC0020` / `0xF00021`.
 
 ---
 
@@ -59,13 +59,13 @@ Classificazione esatta di cosa va portato per `i686` (e poi astratto):
 |---|---|---|
 | `runtime/arm/indirect_dispatch.S` | **Assembly ARM** (`reasm_indirect`, `reasm_extern`, `storm_313_arm`, `storm_334_arm`, `__sse2_available_init*`) | Riscrivere in assembly x86-32 (`jmp`, nessun frame host accumulato) |
 | `runtime/arm/gen_bridge_stubs.py` | Emette `bridge_stubs.S` in **assembly ARM** | Aggiungere `--arch x86` per emettere stub `i386` + `x86_bridge_common` |
-| `runtime/arm/com_bridge_arm.S` | 256 thunk COM in **assembly ARM** | Equivalente `com_bridge_x86.S` (256 thunk + tail-jump) |
+| `runtime/arm/com_bridge.S` | 256 thunk COM in **assembly ARM** | Equivalente `com_bridge_x86.S` (256 thunk + tail-jump) |
 | `runtime/arm/guest_abs_zero.S` | Direttiva `.arm` per `__fpmath = 0` | Equivalente `.text`/`.globl __fpmath; .set __fpmath, 0` (neutro/x86) |
 | `runtime/arm/tls_arm.S` | `__aeabi_read_tp` (solo ARM EABI) | **Non necessario** su `i686` (glibc TLS usa `%gs` nativamente) |
 | `runtime/arm/cpu_llasm.c` | C portabile tranne `uc_mcontext.arm_pc`/`arm_lr` | `#ifdef __i386__` → `REG_EIP` / `REG_ESP` (`_GNU_SOURCE`) |
-| `runtime/arm/game_main_arm.c` | C portabile tranne profiler `uc_mcontext.arm_*` | `#ifdef __i386__` → `REG_EIP`, `REG_EBP`, `REG_ESP` |
-| `runtime/arm/bridge_arm.c` | C quasi tutto portabile (`CLOCK_MONOTONIC_ARM` / `timespec`) | Usare `<time.h>` (`CLOCK_MONOTONIC`) o `#ifdef` pulito |
-| `runtime/arm/game_memory_arm.c`, `elf_support_arm.c`, `x86_helpers.c`, `x87_crt_arm.c`, `crt_init_arm.c`, `guest_call_arm.c`, `indirect_dispatch.c`, `com_bridge_arm.c`, `win32_ext_arm.c`, `storm_sdraw_arm.c`, `game_glue.c` | **C portabile a 32-bit** (nessun inline asm ARM) | Compilabili con `clang -m32` verificando tipi `unsigned long` vs `uint32_t` e struct stat/timespec |
+| `runtime/arm/game_main.c` | C portabile tranne profiler `uc_mcontext.arm_*` | `#ifdef __i386__` → `REG_EIP`, `REG_EBP`, `REG_ESP` |
+| `runtime/arm/bridge.c` | C quasi tutto portabile (`CLOCK_MONOTONIC_ARM` / `timespec`) | Usare `<time.h>` (`CLOCK_MONOTONIC`) o `#ifdef` pulito |
+| `runtime/arm/game_memory.c`, `elf_support.c`, `guest_cpu_helpers.c`, `x87_crt.c`, `crt_init.c`, `guest_call.c`, `indirect_dispatch.c`, `com_bridge.c`, `win32_ext.c`, `storm_sdraw.c`, `game_glue.c` | **C portabile a 32-bit** (nessun inline asm ARM) | Compilabili con `clang -m32` verificando tipi `unsigned long` vs `uint32_t` e struct stat/timespec |
 | `runtime/shim-port/elf/*.c` | Shim C già patchati (copiati da `build/runtime-arm/shim-port/`) | Compilabili direttamente con `clang -m32` |
 | `build/i386-libs/libsmacker-1.2.0.so` | Già compilato ELF 32-bit i386 | Pronto per `SC_SMACKER_SO` o fallback di ricerca |
 
@@ -131,8 +131,8 @@ Separare il codice senza rompere `runtime/arm/` (opzionale: tenere `runtime/arm/
        - Ogni stub `<sym>:` imposta l'indice e salta a `x86_bridge_common`.
 - Adattare i punti puntuali nei `.c` condivisi (usando `#ifdef __i386__` / `#elif defined(__arm__)`):
   - `cpu_llasm.c`: in `cpu_signal`, leggere `uc->uc_mcontext.gregs[REG_EIP]` (con `#define _GNU_SOURCE`).
-  - `game_main_arm.c`: in `sc_prof_handler`, leggere `REG_EIP`, `REG_EBP`, `REG_ESP` su `__i386__`.
-  - `bridge_arm.c`: usare `<time.h>` (`struct timespec`, `clock_gettime(CLOCK_MONOTONIC, &ts)`) valido su entrambe le architetture 32-bit glibc/ABI.
+  - `game_main.c`: in `sc_prof_handler`, leggere `REG_EIP`, `REG_EBP`, `REG_ESP` su `__i386__`.
+  - `bridge.c`: usare `<time.h>` (`struct timespec`, `clock_gettime(CLOCK_MONOTONIC, &ts)`) valido su entrambe le architetture 32-bit glibc/ABI.
   - `runtime/arm/gen_pe_image_bytes.py` / `gen_game_layout.py`: verificare che funzionino anche su oggetti ELF32 i386 (`llvm-nm` / `readelf`).
 
 ### Passo 3 — Compilazione shim, helper e link i686
@@ -164,7 +164,7 @@ Separare il codice senza rompere `runtime/arm/` (opzionale: tenere `runtime/arm/
 Una volta che `i686` e `armv6` condividono la stessa base di runtime:
 
 ### 7.1 Struttura target del repository
-- `runtime/common/`: tutta la logica C indipendente dall'architettura (`cpu_llasm.c`, `game_memory.c`, `bridge.c`, `elf_support.c`, `guest_call.c`, `indirect_dispatch.c`, `x86_helpers.c`, `x87_crt.c`, `crt_init.c`, `storm_sdraw.c`, `game_main.c`).
+- `runtime/common/`: tutta la logica C indipendente dall'architettura (`cpu_llasm.c`, `game_memory.c`, `bridge.c`, `elf_support.c`, `guest_call.c`, `indirect_dispatch.c`, `guest_cpu_helpers.c`, `x87_crt.c`, `crt_init.c`, `storm_sdraw.c`, `game_main.c`).
 - `runtime/arch/<arch>/`: solo lo strato minimo dipendente da ISA/ABI (`indirect_dispatch.S`, `com_bridge.S`, `bridge_stubs_arch.py`, eventuale `tls.S`, helper `ucontext` per il signal handler).
 - `tools/build.sh --arch <i686|armv6|...>`: un'unica pipeline parametrizzata per `TRIPLE`, flag CPU, `OPT`/`LLC` e link.
 

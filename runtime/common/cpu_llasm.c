@@ -13,10 +13,10 @@
  *    `_cpu` object must live in guest-addressable memory below 0x80000000.
  */
 #include "cpu_llasm.h"
-#include "game_memory_arm.h"
+#include "game_memory.h"
 #include "indirect_dispatch.h"
-#include "x86_helpers.h"
-#include "bridge_arm.h"
+#include "guest_cpu_helpers.h"
+#include "bridge.h"
 
 #include <setjmp.h>
 #include <signal.h>

@@ -178,8 +178,8 @@ stage4_runtime() {
     "${CC_ARM[@]}" "${CFLAGS_ARM[@]}" -c -o "$obj/$(basename "${f%.c}").o" "$f"
   done
   # 4c our platform layer
-  for f in cpu_llasm.c game_memory_arm.c x86_helpers.c bridge_arm.c elf_support_arm.c \
-           x87_crt_arm.c crt_init_arm.c guest_call_arm.c win32_ext_arm.c storm_scomp.c; do
+  for f in cpu_llasm.c game_memory.c guest_cpu_helpers.c bridge.c elf_support.c \
+           x87_crt.c crt_init.c guest_call.c win32_ext.c storm_scomp.c; do
     "${CC_ARM[@]}" "${CFLAGS_ARM[@]}" -I "$RT" -c -o "$obj/${f%.c}.o" "$RT/$f"
   done
   "${CC_ARM[@]}" -c -o "$obj/bridge_stubs.o" "$WORK/bridge_stubs.S"
@@ -339,7 +339,7 @@ PYEOF
               done ) \
       || die "le patch del port non si applicano: i sorgenti sc-reasm sono cambiati"
   # main_elf.c NON entra nel runtime ARM: e' il main del modello i386 (asm per lo stack basso,
-  # trap nasm di WinMain, reasm_call_on_stack). Il main ARM e' runtime/common/game_main_arm.c.
+  # trap nasm di WinMain, reasm_call_on_stack). Il main ARM e' runtime/common/game_main.c.
   # storm_ext.c resta fuori: e' il livello di override degli ordinali storm del modello i386
   # (usa la tabella IAT generata g_imports e reasm_storm_ordinal_va); qui gli ordinali sono VA
   # dirette della storm tradotta e l'override non ha nulla da sostituire.
@@ -364,8 +364,8 @@ PYEOF
     [[ "$(basename "$f")" == llasm_cmps.c ]] && f="$ROOT/runtime/common/llasm_cmps.c"
     "${CC_ARM[@]}" "${CFLAGS_ARM[@]}" -c -o "$OBJ/$(basename "${f%.c}").o" "$f"
   done
-  for f in cpu_llasm.c game_memory_arm.c x86_helpers.c bridge_arm.c elf_support_arm.c \
-           x87_crt_arm.c crt_init_arm.c guest_call_arm.c win32_ext_arm.c storm_scomp.c; do
+  for f in cpu_llasm.c game_memory.c guest_cpu_helpers.c bridge.c elf_support.c \
+           x87_crt.c crt_init.c guest_call.c win32_ext.c storm_scomp.c; do
     "${CC_ARM[@]}" "${CFLAGS_ARM[@]}" -I "$RT" -c -o "$OBJ/${f%.c}.o" "$RT/$f"
   done
   "$PY" "$RT/gen_storm_ordinals.py" --json "$SC_REASM/analysis/storm_ordinals.json" \
@@ -425,8 +425,8 @@ PYEOF
   for f in bridge_table bridge_symbols shim_calls pe_headers_arm; do
     "${CC_ARM[@]}" "${CFLAGS_ARM[@]}" -I "$RT" -I "$G" -c -o "$OBJ/$f.o" "$G/$f.c"
   done
-  "${CC_ARM[@]}" "${CFLAGS_ARM[@]}" -I "$RT" -I "$G" -c -o "$OBJ/game_main_arm.o" \
-      "$RT/game_main_arm.c"
+  "${CC_ARM[@]}" "${CFLAGS_ARM[@]}" -I "$RT" -I "$G" -c -o "$OBJ/game_main.o" \
+      "$RT/game_main.c"
 
   # 8.9 link: script con INSERT (il layout del CRT/libc/runtime resta quello predefinito)
   say "    link (layout ai VA originali + codice guest in aree libere basse)"

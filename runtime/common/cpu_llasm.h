@@ -20,8 +20,8 @@
  * architecture-neutral reference implementations shipped by SR are compiled verbatim
  * (vendor/sr/SR/llasm-support/llasm_*.c, 133 helper functions). This file/layer supplies what
  * the emitter expects *around* them: CPU construction, guest stack, guest memory access,
- * TEB/PEB (x86_helpers.c), fixed-VA mapping (game_memory_arm.c) and the import bridge
- * (bridge_arm.c).
+ * TEB/PEB (guest_cpu_helpers.c), fixed-VA mapping (game_memory.c) and the import bridge
+ * (bridge.c).
  */
 #ifndef ARM_CPU_LLASM_H
 #define ARM_CPU_LLASM_H

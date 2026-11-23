@@ -1,8 +1,29 @@
-# runtime/arm — runtime Linux ARMv6 per il guest LLASM (StarCraft + storm.dll)
+# runtime/common — runtime condiviso da tutte le architetture (ARMv6/ARMv7, x86)
 
-Runtime nativo per Raspberry Pi OS Bookworm armhf (ARM1176JZF-S, VFPv2 hard-float, senza NEON):
-collega gli oggetti LLVM generati da SRW + `llasm` ai servizi C/SDL2 già esistenti in
-`~/dev/sc-reasm/tools/elf/`, senza Wine e senza DLL Windows.
+Questi sorgenti **non sono specifici di un'architettura**: `tools/build-runtime-armv7.sh` e
+`tools/build-runtime-x86.sh` compilano gli stessi `.c` con target diversi (armv7 hard-float con
+sysroot armhf, oppure i686 con `-m32`). Storicamente molti file avevano il suffisso `_arm`
+(`bridge_arm.c`, `game_main_arm.c`, `storm_sdraw_arm.c`, `x86_helpers.c`…): il suffisso è stato
+rimosso per non far credere che esistano due implementazioni.
+
+Dove sta davvero il codice per-architettura:
+
+- `runtime/arch/arm/*.S` e `runtime/arch/x86/*.S` — seam in assembly (dispatch indiretto, bridge
+  COM, azzeramento guest, TLS).
+- blocchi `#if defined(__arm__)` / `#if defined(__i386__)` nei sorgenti condivisi: **224 righe su
+  20.697** (1,1%), elencate in `reports/REPORT-x86-vs-arm.md`.
+- artefatti **generati** per-arch: `guest_layout_arm.h` / `guest_layout_x86.h`,
+  `pe_headers_arm.c`, `storm_ordinals[_arm].c`.
+- `guest_cpu_helpers.c/.h` (ex `x86_helpers`): nome arch-neutro perché è compilato per ogni host;
+  gli helper `X86_*` al suo interno riguardano la CPU **emulata** (il guest i386), non l'host.
+- `cpu_llasm.c`, `guest_cpu_helpers.c` restano gli unici punti che nominano `x86`/`fs:` perché
+  descrivono la semantica del guest, non l'architettura di build.
+
+Runtime nativo per il guest LLASM (StarCraft + storm.dll): collega gli oggetti LLVM generati da SRW
++ `llasm` ai servizi C/SDL2 già esistenti in `~/dev/sc-reasm/tools/elf/`, senza Wine e senza DLL
+Windows. Il percorso ARMv6 (Raspberry Pi OS armhf, ARM1176JZF-S, VFPv2) è quello storico descritto
+dagli script `tools/build-runtime-arm.sh`; il port ARMv7/Pinebook e quello i686 usano rispettivamente
+`tools/build-runtime-armv7.sh` e `tools/build-runtime-x86.sh`.
 
 Costruzione e verifica end-to-end (sysroot, runtime, guest, smoke test, port degli shim,
 **link del gioco completo**, boot sotto qemu):
@@ -38,21 +59,21 @@ Artefatti in `build/sysroot/` (sysroot Raspberry Pi OS, 1,1 GB) e `build/runtime
   reale (4 MiB da `0x02000000`), `cpu_llasm_run` (entry `c_*`) e `cpu_llasm_run_raw` (corpo `proc X
   public`, con sentinella), helper di push/pop/lettura/scrittura, handler `SIGSEGV`/`SIGBUS` che
   stampa fault address + eip/esp/eax/edx del guest (exit 9).
-- **`x86_helpers.c/.h`** — le seam che i 137 helper del vendor chiamano: TEB/PEB emulato
+- **`guest_cpu_helpers.c/.h`** — le seam che i 137 helper del vendor chiamano: TEB/PEB emulato
   (`X86_ReadFsDword`/`X86_WriteFsDword`, nessun `%fs`), `X86_ReadMemProcedure`/
   `X86_WriteMemProcedure` con validazione del VA, porte I/O e `int` x86 come stop diagnostico
   (mai uno stub che ritorna), `X86_InterruptFlag`.
-- **`game_memory_arm.c/.h`** — mapping ai VA originali (`MAP_FIXED`, niente `MAP_32BIT`), arena
+- **`game_memory.c/.h`** — mapping ai VA originali (`MAP_FIXED`, niente `MAP_32BIT`), arena
   bump sotto `0x80000000`, registro delle regioni, `arm_va_is_mapped`, selftest del contratto
   `~ptr` (negativo solo se il puntatore è < `0x80000000`).
-- **`bridge_arm.c/.h` + `bridge_table.def` + `gen_bridge_stubs.py`** — 17 import Win32 con arità
+- **`bridge.c/.h` + `bridge_table.def` + `gen_bridge_stubs.py`** — 17 import Win32 con arità
   stdcall; il generatore emette gli stub ARM (`bridge_stubs.S`) e la tabella nome→indirizzo. Il
   dispatcher C toglie dalla pila del guest il return EIP e `nargs` argomenti, esegue
   l'implementazione e restituisce il VA di ripresa: lo stub fa `bx`, quindi un `call`+`ret` del
   guest non consuma stack host.
 - **`gen_storm_ordinals.py`** — tabella ordinale→VA di storm (379 export da
   `sc-reasm/analysis/storm_ordinals.json`): storm è tradotta in-process, non passa dal bridge.
-- **`game_main_arm.c`** — main del runtime ARM: registra le regioni delle immagini, ripristina gli
+- **`game_main.c`** — main del runtime ARM: registra le regioni delle immagini, ripristina gli
   header PE ai VA delle immagini, crea `_cpu`/TEB e entra nella CRT tradotta (`loc_404C21`) con
   `cpu_llasm_run_raw`.
 - **`gen_shims_bridge.py`** — l'arità stdcall dei 291 import serviti dagli shim C viene dai loro
@@ -62,10 +83,10 @@ Artefatti in `build/sysroot/` (sysroot Raspberry Pi OS, 1,1 GB) e `build/runtime
 - **`patch_guest_pointers.py`** — dopo il link riscrive nel binario i puntatori a codice che SRW ha
   lasciato come byte nei datasegment (`daddr` non riconosciuto), usando i simboli `loc_<VA>`; gli
   indirizzi senza funzione tradotta vengono azzerati e stampati (worklist del lifting).
-- **`guest_call_arm.c`** — chiamata *dentro* il guest (window procedure, dialog procedure): spinge
+- **`guest_call.c`** — chiamata *dentro* il guest (window procedure, dialog procedure): spinge
   gli argomenti sullo stack emulato, entra nel guest e torna via `longjmp`. Senza questo una
   finestra non riceve `WM_CREATE`.
-- **`elf_support_arm.c/.h`** — log (`reasm_elf_log`…), `GetModuleHandleA`/`LoadLibraryA`/
+- **`elf_support.c/.h`** — log (`reasm_elf_log`…), `GetModuleHandleA`/`LoadLibraryA`/
   `GetProcAddress` (per nome → stub del bridge; `#N` o `ordinal_…` → VA tradotta),
   `loader_init`/`teb_init`/`teb_set_stack`/`teb_envA` sopra il TEB emulato.
 - **`patches/0001-i386-only-seams-to-arm.patch`** — unica modifica al codice C di sc-reasm

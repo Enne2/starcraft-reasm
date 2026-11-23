@@ -9,6 +9,9 @@ SR="$ROOT/vendor/sr/SR/llasm-support"
 CC=(clang --target=i686-unknown-linux-gnu -m32 -fno-pie)
 CFLAGS=(-O1 -g -Wall -Wextra -Wno-unused-parameter)
 mkdir -p "$OUT" "$OUT/pe-bytes"
+# Gli oggetti del runtime sono rigenerati ogni volta da $RT: se un sorgente viene rinominato o
+# rimosso, un .o vecchio rimasto qui verrebbe linkato comunque (simboli doppi o codice fantasma).
+rm -f "$OUT"/*.o
 [[ -f "$ENTRY/StarCraft.entry.o" && -f "$ENTRY/storm.entry.o" ]] || { echo 'entry-x86 objects missing' >&2; exit 2; }
 [[ -f "$ENTRY/StarCraft.entry.ll" && -f "$ENTRY/storm.entry.ll" ]] || { echo 'entry-x86 IR missing' >&2; exit 2; }
 
@@ -28,11 +31,11 @@ for src in "$SR"/llasm_*.c; do
   [[ "$(basename "$src")" == llasm_cmps.c ]] && src="$RT/llasm_cmps.c"
   "${CC[@]}" "${CFLAGS[@]}" -I "$SR" -c "$src" -o "$OUT/$(basename "${src%.c}").o"
 done
-for name in cpu_llasm game_memory_arm x86_helpers bridge_arm elf_support_arm x87_crt_arm crt_init_arm guest_call_arm win32_ext_arm \
-            indirect_dispatch com_bridge_arm storm_sdraw_arm storm_scomp game_glue; do
+for name in cpu_llasm game_memory guest_cpu_helpers bridge elf_support x87_crt crt_init guest_call win32_ext \
+            indirect_dispatch com_bridge storm_sdraw storm_scomp game_glue; do
   "${CC[@]}" "${CFLAGS[@]}" -I "$RT" -I "$OUT" -c "$RT/$name.c" -o "$OUT/$name.o"
 done
-"${CC[@]}" "${CFLAGS[@]}" -I "$RT" -I "$OUT" -c "$RT/game_main_arm.c" -o "$OUT/game_main_arm.o"
+"${CC[@]}" "${CFLAGS[@]}" -I "$RT" -I "$OUT" -c "$RT/game_main.c" -o "$OUT/game_main.o"
 "${CC[@]}" "${CFLAGS[@]}" -std=c11 -I "$ROOT/runtime/shim-port/elf" -c "$ROOT/runtime/shim-port/elf/sc_ctl.c" -o "$OUT/sc_ctl.o"
 for src in "$X86/indirect_dispatch_x86.S" "$X86/com_bridge_x86.S" "$X86/guest_abs_zero_x86.S" "$OUT/bridge_stubs.S" "$OUT/guest_pe_bytes.S"; do
   objname="$(basename "${src%.S}")"

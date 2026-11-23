@@ -8,7 +8,7 @@
 #define GAME_STDCALL __attribute__((stdcall))
 #else
 /* ARMv6 port: AAPCS has no stdcall. The guest stack discipline is the import bridge's job
- * (runtime/arm/bridge_arm.c), never the host calling convention, so the attribute must vanish
+ * (runtime/arm/bridge.c), never the host calling convention, so the attribute must vanish
  * rather than be silently ignored. */
 #define GAME_STDCALL
 #endif

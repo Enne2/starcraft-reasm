@@ -1,4 +1,4 @@
-/* runtime/arm/x86_helpers.h — platform seams the LLASM reference helpers call into.
+/* runtime/arm/guest_cpu_helpers.h — platform seams the LLASM reference helpers call into.
  *
  * Evidence for the exact set of symbols (from the emitted IR in build/slice and the .llinc
  * declarations in vendor/sr/SR/llasm-support):

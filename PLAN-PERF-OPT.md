@@ -4,14 +4,14 @@
 **Basato su evidenze misurate in:**
 - `work/link/REPORT-arm-prof.md` (campionamento `SC_PROF=1`, 1000 campioni in-process)
 - `work/qemu/REPORT-arm-pbp.md` (misure reali su Pinebook Pro RK3399, `REASM_TRACE=1` 10 s, `SC_PRESENT=cpu`, `menu3` e `menu8`)
-- Analisi diretta di `runtime/common/{indirect_dispatch.c,storm_sdraw_arm.c,game_memory_arm.c}`, `runtime/shim-port/elf/host_elf.c`, `tools/dispatch-ir.py`
+- Analisi diretta di `runtime/common/{indirect_dispatch.c,storm_sdraw.c,game_memory.c}`, `runtime/shim-port/elf/host_elf.c`, `tools/dispatch-ir.py`
 
 ---
 
 ## 1. Colli di bottiglia già individuati sui test Pinebook Pro / ARM
 
 ### 1.1 Hotspot già misurati e loro stato attuale
-1. **`proc_range()` in `runtime/common/storm_sdraw_arm.c` — ~65–68% CPU prima della cache:**
+1. **`proc_range()` in `runtime/common/storm_sdraw.c` — ~65–68% CPU prima della cache:**
    - Nel profilo `SC_PROF=1` (`work/link/REPORT-arm-prof.md`), `libc` `open+0xE4` (`61,8%–63,6%`) + `vfscanf`/`sscanf` (`~4%`) dominavano la CPU perché `proc_range()` apriva e parsava `/proc/self/maps` a ogni validazione di superficie/puntatore.
    - **Stato attuale:** è stata aggiunta una cache da `4096` entry (`g_map_cache`) invalidata da `g_vm_generation`.
    - **Costo residuo:** ogni `VirtualAlloc` / `VirtualFree` / `VirtualProtect` incrementa `g_vm_generation` e forza il re-parsing completo di `/proc/self/maps`; inoltre `map_contains()` esegue una scansione lineare sotto `pthread_mutex_lock`.
@@ -41,11 +41,11 @@
    - Spostare `g_ring` dentro `_cpu` (o dietro flag/macro di build `SC_EDGE_RING=1`, oppure popolarlo solo su cache miss / negli ultimi N salti prima di un fault) ed eliminare i due `arm_va_is_mapped()` sul percorso caldo.
    - *Impatto atteso:* elimina ~4–5% di CPU globale e rimuove una data race su `g_ring` in multi-thread.
 
-2. **Fast-path range in `arm_va_is_mapped` (`game_memory_arm.c`) e `proc_range` (`storm_sdraw_arm.c`)**
+2. **Fast-path range in `arm_va_is_mapped` (`game_memory.c`) e `proc_range` (`storm_sdraw.c`)**
    - In `arm_va_is_mapped`: testare subito i 2 range più frequenti (`ARM_STACK_BASE` e `ARM_ARENA_BASE`) come confronto diretto, poi il resto di `g_regions`.
    - In `proc_range`: testare prima gli intervalli guest statici/arena prima di prendere `g_map_mutex`; in `map_contains()` sostituire la scansione lineare su `g_map_cache` (fino a 4096 entry) con **ricerca binaria**.
 
-3. **Ridurre il churn `VirtualAlloc` / `VirtualFree` e invalidazioni `g_vm_generation` (`win32_shim.c` / `game_memory_arm.c`)**
+3. **Ridurre il churn `VirtualAlloc` / `VirtualFree` e invalidazioni `g_vm_generation` (`win32_shim.c` / `game_memory.c`)**
    - Verificare in `win32_shim.c` se le allocazioni temporanee di decompressione/loading Storm (`MEM_COMMIT`/`MEM_DECOMMIT`/`MEM_RELEASE` ripetitive) possono usare una piccola freelist/cache di blocchi già mappati invece di chiamare `mprotect`/`madvise` + incrementare `g_vm_generation` centinaia di volte al secondo.
    - Incrementare `g_vm_generation` solo quando cambia davvero la mappa di indirizzi/permessi esterni, non per allocazioni dentro un blocco arena già noto.
 
@@ -70,7 +70,7 @@
 - **Candidati ad alto impatto da verificare in `build/lift-full/storm.orig.dll.i64`:**
   1. **`#551` (`SCompDecompress` @ `0x1501D310`)**: decompressione buffer-to-buffer (PKWARE DCL `explode`, Huffman, ADPCM mono/stereo, multi-pass). Eliminare `_cpu`/`eflags`/`reasm_indirect` nei loop bitstream velocizza il caricamento di tutti gli asset compressi (MPQ, GRP, PCX, TBL, mappe).
   2. **Loop di decifratura settori MPQ (`loc_15013C80` / routine collegate da verificare in IDA):** routine pura `decrypt(uint32_t *buf, size_t bytes, uint32_t key)` sulla tabella `0x500` dword già inizializzata da Storm.
-  3. **`storm_sdraw_arm.c` (`#313` / `#334`):** per `ARMv7hf` (Pinebook Pro) abilitare path vettoriali/NEON o word-unrolled sui ROP più frequenti in partita (`0xCC0020`, `0xF00021`, `PATCOPY`, RLE/trasparenze man mano che emergono dal Single Player).
+  3. **`storm_sdraw.c` (`#313` / `#334`):** per `ARMv7hf` (Pinebook Pro) abilitare path vettoriali/NEON o word-unrolled sui ROP più frequenti in partita (`0xCC0020`, `0xF00021`, `PATCOPY`, RLE/trasparenze man mano che emergono dal Single Player).
 
 ---
 
@@ -80,7 +80,7 @@
    - Controllare `g_key[(target >> 2) & 4095] == target` direttamente in assembly prima di creare un frame/chiamare `reasm_indirect_resolve` in C (attualmente anche su cache hit si entra in C e si chiama `cpu_llasm_current()`).
 2. **Profilo dedicato `armv7` in `tools/build.sh` (Pinebook Pro):**
    - `-mtriple=armv7a-unknown-linux-gnueabihf -mcpu=cortex-a53 -mattr=+vfp3,+neon,+hwdiv-arm -float-abi=hard` (o `-mfpu=neon-vfpv4` / `vfpv3-d16`).
-   - Abilita `UDIV`/`SDIV` hardware, 32 registri VFP, auto-vettorizzazione NEON su `llasm` / `storm_sdraw_arm.c` / `libsmacker`, barriere `dmb` native ed evita le chiamate a `0xFFFF0FE0` (kuser helper).
+   - Abilita `UDIV`/`SDIV` hardware, 32 registri VFP, auto-vettorizzazione NEON su `llasm` / `storm_sdraw.c` / `libsmacker`, barriere `dmb` native ed evita le chiamate a `0xFFFF0FE0` (kuser helper).
 3. **Profilo `armv6` (Raspberry Pi Zero / Pi 1):**
    - Mantenere `opt -passes='default<O2>'`, `-mcpu=arm1176jzf-s -mattr=+vfp2,-neon -float-abi=hard -marm`, linker senza padding inutile del segmento `LOAD` (modello `link-arm.sh` ~21 MB ELF, non i 217 MB attuali di `link-x86.sh`), esecuzione da console con `SDL_VIDEODRIVER=kmsdrm`.
 

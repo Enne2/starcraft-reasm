@@ -1,4 +1,4 @@
-/* runtime/arm/game_memory_arm.h — guest address space for the ARMv6 runtime.
+/* runtime/arm/game_memory.h — guest address space for the ARMv6 runtime.
  *
  * Requirement that drives everything here: Win32 32-bit code (storm.dll in particular) encodes
  * "empty container" as `~ptr`, which is negative only when the pointer is < 0x80000000. On an

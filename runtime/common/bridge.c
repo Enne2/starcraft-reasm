@@ -1,4 +1,4 @@
-/* runtime/arm/bridge_arm.c — implementations of the Win32 imports in bridge_table.def.
+/* runtime/arm/bridge.c — implementations of the Win32 imports in bridge_table.def.
  *
  * Every import has the guest calling convention: on entry r0 = %_cpu; arguments are on the
  * guest stack at [esp + 4*i] (the return EIP has already been popped by arm_bridge_common_c).
@@ -10,10 +10,10 @@
  * (sc-reasm/tools/elf/win32_shim.c) while keeping their own, ARM-portable implementation:
  * no %fs, no int 0x80, no inline asm.
  */
-#include "bridge_arm.h"
+#include "bridge.h"
 #include "cpu_llasm.h"
-#include "x86_helpers.h"
-#include "game_memory_arm.h"
+#include "guest_cpu_helpers.h"
+#include "game_memory.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -53,7 +53,7 @@ void imp_Sleep(_cpu *cpu) {
  * Eseguirlo in modo sincrono qui dentro non e' un'alternativa: il corpo di storm aspetta un evento
  * che segnala il chiamante -> deadlock misurato (§4).
  * Quindi il port crea un thread host vero con `_cpu` e stack emulato propri
- * (runtime/arm/guest_call_arm.c, arm_guest_thread_start).
+ * (runtime/arm/guest_call.c, arm_guest_thread_start).
  */
 #define TH_HANDLE_BASE 0x72000000u
 

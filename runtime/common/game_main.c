@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-/* runtime/arm/game_main_arm.c — entry point of the ARMv6 StarCraft runtime (starcraft-armv6).
+/* runtime/arm/game_main.c — entry point of the ARMv6 StarCraft runtime (starcraft-armv6).
  *
  * What it does, in the order the i386 runtime did it (sc-reasm/tools/elf/main_elf.c), adapted to
  * the LLASM execution model:
@@ -20,11 +20,11 @@
  * so there is nothing to patch at startup. `arm_bridge_unk_count()` is printed because each UNK
  * entry is a place where the game will stop with a name — the worklist of this port.
  */
-#include "bridge_arm.h"
+#include "bridge.h"
 #include "cpu_llasm.h"
-#include "elf_support_arm.h"
-#include "game_memory_arm.h"
-#include "x86_helpers.h"
+#include "elf_support.h"
+#include "game_memory.h"
+#include "guest_cpu_helpers.h"
 #if defined(__i386__)
 #include "guest_layout_x86.h"
 #else
@@ -42,7 +42,7 @@
 #include <ucontext.h>
 #include <stdio.h>
 
-/* Call-out del runtime verso una procedura guest (guest_call_arm.c): risolve il VA con la
+/* Call-out del runtime verso una procedura guest (guest_call.c): risolve il VA con la
  * tabella della dispatch, spinge gli argomenti sullo stack emulato e ritorna al sentinella. */
 extern int arm_guest_calln(uint32_t proc, unsigned nargs, const uint32_t *args, int *status);
 extern void win32_shim_init(void);

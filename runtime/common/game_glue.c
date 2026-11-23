@@ -5,8 +5,8 @@
  * those symbols linkable without pretending that its dynamic IAT or WinMain trap is active.
  */
 #include "cpu_llasm.h"
-#include "bridge_arm.h"
-#include "elf_support_arm.h"
+#include "bridge.h"
+#include "elf_support.h"
 
 #include <stdint.h>
 
@@ -30,9 +30,9 @@ int build_guard_check(int check_only) {
 }
 
 /* Legacy i386 loader helper. The ARM guest stack lives at cpu->_esp, not on the host stack
- * (elf_support_arm.h); consequently stack_top is intentionally ignored. This signature receives
+ * (elf_support.h); consequently stack_top is intentionally ignored. This signature receives
  * a host C callback, unlike guest callbacks, which use arm_guest_call4/arm_guest_calln in
- * guest_call_arm.c. */
+ * guest_call.c. */
 void reasm_call_on_stack(void *stack_top, void (*fn)(void)) {
     (void) stack_top;
     if (!fn) {
@@ -64,7 +64,7 @@ unsigned int reasm_storm_ordinal_va(int ord) {
 }
 
 /* The old x86 loader patches native WinMain and transfers control here. The ARM runtime instead
- * enters the translated CRT directly from game_main_arm.c; do not guess a second entry VA here. */
+ * enters the translated CRT directly from game_main.c; do not guess a second entry VA here. */
 void winmain_trap(void) {
     reasm_elf_log("[arm-game-glue] winmain_trap legacy invocato; nessun entry ARM selezionato\n");
 }

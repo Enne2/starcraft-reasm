@@ -4,7 +4,7 @@
  * Storm 313's frame/register setup and row-stride deltas are at IDA 0x15036310-0x15036339.
  */
 #include "cpu_llasm.h"
-#include "game_memory_arm.h"
+#include "game_memory.h"
 
 #include <stdint.h>
 #include <stdlib.h>

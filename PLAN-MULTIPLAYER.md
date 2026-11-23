@@ -113,7 +113,7 @@ StarCraft usa un motore **lockstep deterministico a turni**: tutti i peer devono
    - **Code UDP (`max_queue_size=16`) e `recvfrom` singolo:** in `spiReceive`, svuotare in sicurezza senza drop e verificare se Storm gestisce autonomamente la ritrasmissione (SNet ha ack/resend interno sopra `spiSend`/`spiReceive` — verificare i pacchetti di retry in `storm.orig.dll.i64`).
    - **Sbilanciamento CPU tra host diversi:** se un peer rallenta (es. su Raspberry Pi Zero durante loading/audio/Smacker), l'intera partita si ferma in attesa dei suoi turni.
 3. **ATTENZIONE — Rischio di desync reale nel cross-play `x86` ↔ `ARM`:**
-   - In `runtime/common/x87_crt_arm.c` e negli helper `llasm`, le operazioni floating-point su ARM girano in IEEE-754 **double 64-bit**, mentre su `i686` usano **`x87` 80-bit extended precision** (se l'IR usa `x86_fp80` o `fadd`/`fmul`/`sin`/`cos`/`ftol` CRT).
+   - In `runtime/common/x87_crt.c` e negli helper `llasm`, le operazioni floating-point su ARM girano in IEEE-754 **double 64-bit**, mentre su `i686` usano **`x87` 80-bit extended precision** (se l'IR usa `x86_fp80` o `fadd`/`fmul`/`sin`/`cos`/`ftol` CRT).
    - Finché giocano insieme due `x86` (o due `ARM`), l'esecuzione è identica; **prima di abilitare partite miste `x86` ↔ `ARM`**, verificare su partita reale (o trace di checksum turno SNet) che nessun calcolo di gameplay/pathing/audio/init dipenda da arrotondamenti `80-bit` vs `64-bit`.
 
 ---

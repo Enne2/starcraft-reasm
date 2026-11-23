@@ -12,7 +12,7 @@
 #include "win32_shell_dlg.h"
 #include "reasm_elf.h"
 /* reasm-toolkit declares these hooks stdcall, but the x86 runtime implementations
- * (runtime/arm/elf_support_arm.c) are ordinary C/cdecl. Calling them through the imported
+ * (runtime/arm/elf_support.c) are ordinary C/cdecl. Calling them through the imported
  * declaration makes clang emit stdcall cleanup for a cdecl callee and corrupts the host stack.
  * Keep the ARM declarations/calls unchanged; on i386, call the same symbols via cdecl types. */
 #if defined(__i386__)
@@ -38,10 +38,10 @@ static void *reasm_get_proc_cdecl(void *m, const char *n) {
  * dava precedenza a questi stub e il gioco mostrava "File error creating new character"
  * (CreateDirectoryA non impostava ERROR_ALREADY_EXISTS=183 su un path esistente). */
 #include "win32_game.h"
-#include "game_memory_arm.h"
+#include "game_memory.h"
 #if defined(__arm__) || defined(SC_PORT_EMULATED_TEB)
-#include "x86_helpers.h"   /* Port: emulated TEB (X86_Read/WriteFsDword) */
-#include "game_memory_arm.h" /* mapped guest memory validation for SEH records */
+#include "guest_cpu_helpers.h"   /* Port: emulated TEB (X86_Read/WriteFsDword) */
+#include "game_memory.h" /* mapped guest memory validation for SEH records */
 #endif
 
 #define S __attribute__((stdcall))

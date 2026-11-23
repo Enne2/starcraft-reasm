@@ -84,7 +84,7 @@ ENTRY(armtest_probe,                1, imp_armtest_probe)
  * quindi il corpo e' indistinguibile da una procedura tradotta.
  *
  * Semantica: su ARM1176 il bit ID di EFLAGS non e' commutabile -> niente cpuid -> i due flag
- * SSE2 della DLL restano 0 e il ritorno e' 0. Corpo provato in runtime/arm/crt_init_arm.c
+ * SSE2 della DLL restano 0 e il ritorno e' 0. Corpo provato in runtime/arm/crt_init.c
  * (`__sse2_available_init_storm_body`, globals 0x1505FC20 / 0x1505FC1C), lo stesso che serve la
  * voce `--map-extra 0x15040E07=__sse2_available_init_storm` per chi salta al VA nudo. */
 ENTRY(crt_unlifted_15040E07,        0, imp_crt_unlifted_15040E07)

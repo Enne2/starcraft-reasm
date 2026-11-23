@@ -1,4 +1,4 @@
-/* runtime/arm/x87_crt_arm.c — the MSVC CRT floating-point helper the lifted code calls.
+/* runtime/arm/x87_crt.c — the MSVC CRT floating-point helper the lifted code calls.
  *
  * `__CIpow` is the chip-independent `pow` entry of the MSVC x87 CRT: a naked routine that takes
  * both operands from the x87 register stack and leaves the result there (C prototype

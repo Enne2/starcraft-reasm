@@ -1,16 +1,16 @@
-/* runtime/arm/elf_support_arm.h — ARM replacements for the x86 loader/TEB surface used by the
+/* runtime/arm/elf_support.h — ARM replacements for the x86 loader/TEB surface used by the
  * sc-reasm ELF shims.
  *
  * What the shims expect from the toolkit (see ~/dev/reasm-toolkit/runtime/elf/{reasm_elf.h,teb.h}):
  *
- *   reasm_elf_log / log_hex / log_iat / unimplemented     -> elf_support_arm.c (portable C)
- *   reasm_elf_GetModuleHandleA/LoadLibraryA/GetProcAddress -> elf_support_arm.c (bridge aware)
- *   loader_init / teb_init / teb_set_stack / teb_envA     -> elf_support_arm.c
+ *   reasm_elf_log / log_hex / log_iat / unimplemented     -> elf_support.c (portable C)
+ *   reasm_elf_GetModuleHandleA/LoadLibraryA/GetProcAddress -> elf_support.c (bridge aware)
+ *   loader_init / teb_init / teb_set_stack / teb_envA     -> elf_support.c
  *
  * The i386 originals reached the TEB through `set_thread_area` + `%fs` and the images through a
  * linker script placing them at their PE VAs. On ARM:
- *   - the TEB is the emulated page from x86_helpers.c (no segment register exists), and
- *   - the images are mapped with MAP_FIXED at their original VAs by game_memory_arm.c.
+ *   - the TEB is the emulated page from guest_cpu_helpers.c (no segment register exists), and
+ *   - the images are mapped with MAP_FIXED at their original VAs by game_memory.c.
  * `reasm_call_on_stack` is *not* needed: in the LLASM model the guest stack is `cpu->esp`
  * (a VA inside the low arena), not the host stack, so a translated call never touches it.
  */

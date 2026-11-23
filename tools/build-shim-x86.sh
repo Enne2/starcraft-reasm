@@ -113,7 +113,7 @@ for obj in "$OUT"/llasm/*.o "$OUT"/shim/*.o "$OUT"/shim-redef/*.o; do
 done
 "$NM" -u "$OUT/shim-redef"/*.o > "$OUT/shim_check/undefined-redefined.txt"
 # Guest-facing dynamic API/COM calls intentionally reference these shared bridge helpers;
-# runtime/common/elf_support_arm.c and com_bridge_arm.c provide them in the linked i386 runtime.
+# runtime/common/elf_support.c and com_bridge.c provide them in the linked i386 runtime.
 if grep -Ev ' [Uw] (arm_bridge_lookup_thunk|arm_com_wrap_vtable|arm_com_thunk)$' \
     "$OUT/shim_check/undefined-redefined.txt" | \
     grep -Eiq '(__aeabi_|arm_bridge|arm_com_thunk|__arm__)'; then
