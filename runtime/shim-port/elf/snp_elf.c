@@ -25,11 +25,17 @@ extern int sendto(int, const void *, unsigned int, int, const void *, unsigned i
 extern int recvfrom(int, void *, unsigned int, int, void *, unsigned int *);
 extern int memcmp(const void *, const void *, unsigned int);
 extern void *malloc(unsigned long);
+extern void *memcpy(void *, const void *, unsigned long);
+extern int *__errno_location(void);
 extern void free(void *);
 extern char *getenv(const char *);
 extern int fcntl(int, int, ...);
 extern int setsockopt(int, int, int, const void *, unsigned int);
 extern int clock_gettime(int, void *);
+extern int nanosleep(const void *, void *);
+extern int pthread_create(unsigned long *, const void *, void *(*)(void *), void *);
+extern int pthread_detach(unsigned long);
+extern int REASM_STDCALL SetEvent(void *) __attribute__((weak));
 
 #define SNP_MODULE 0x72000001u /* standalone gate only; runtime uses the PE resource handle */
 #define SNP_AF_INET 2
@@ -97,7 +103,7 @@ struct SnpSockaddrIn {
 };
 
 static const char g_provider_name[] = "Native POSIX Loopback";
-static const char g_provider_description[] = "Local UDP loopback; no remote game advertisement is synthesized.";
+static const char g_provider_description[] = "UDP transport with optional configured IPv4 peers; no remote game advertisement is synthesized.";
 /* Nome/descrizione UDP estratti da caps.dat del modulo originale; il trasporto nativo resta
  * locale (nessun protocollo LAN remoto implementato). Le CAPS descrivono il nostro backend. */
 static const struct SnpProfile {
@@ -106,7 +112,7 @@ static const struct SnpProfile {
 } g_profiles[] = {
     { 0u, g_provider_name, g_provider_description },
     { 0x5544504eu, "Local Area Network (UDP)",
-      "All computers must be connected to a TCP/IP-compatible network." }
+      "IPv4 UDP transport; peers are configured with SC_LAN_PEERS." }
 };
 #define SNP_PROFILE_COUNT (sizeof g_profiles / sizeof g_profiles[0])
 static struct SnpCaps g_caps = { 0x24, SNP_CAPS_FLAGS, 500, 16, 8, 1000, 50, 8, 2 };
@@ -116,6 +122,90 @@ static u32 g_net_poll_ms = 1;
 static int g_poll_socket_fd = -1;
 static int g_last_poll_valid;
 static long long g_last_poll_ns;
+static volatile int g_poll_thread_running;
+static volatile int g_poll_thread_stop;
+static volatile int g_event_packet_pending;
+static unsigned long g_poll_thread;
+static u32 g_receive_event;
+#define SNP_MAX_PEERS 32u
+static struct SnpSockaddrIn g_peers[SNP_MAX_PEERS];
+static u32 g_peer_count;
+
+/* ---- Discovery UDP e GameList ------------------------------------------------------------
+ * Contratti misurati in IDA su standard.snp (base 0x1D000000) e storm.orig.dll (0x15000000);
+ * vedi reports/ANALYSIS-snp-contracts.md. Sintesi con gli indirizzi che giustificano i campi:
+ *  - due socket: discovery 6111, gioco 6112 (snp:1D009D39-1D009E6D);
+ *  - datagramma +0x00 checksum (Fletcher mod 255 all'indietro, snp:1D00F060/1D008BD0),
+ *    +0x02 u16 lunghezza, +0x04 u16 tipo (0 annuncio/risposta, 1 ritiro, 2 probe 20 byte),
+ *    +0x06 u16 zero, +0x08 u32 product, +0x0C u32 versione, +0x10 u32 flags,
+ *    +0x14 (tipi 0/1) name\0 statstring\0 blob (snp:1D008F14-1D008F8F);
+ *  - probe in broadcast a 255.255.255.255:6111, risposta unicast col tipo 0 conservato
+ *    (snp:1D009451, snp:1D008780-1D0087C1);
+ *  - TTL voce 10000 ms dal tick di ricezione (snp:1D00904A push 2710h), chiave = sockaddr_in
+ *    con porta normalizzata a 6112 (snp:1D0089B6);
+ *  - nodo SnpGame = 0x13C byte, offset provati sotto (snp:1D008B7F push 13Ch, storm:15038B06). */
+#define SNP_DISC_PORT_DEFAULT 6111u
+#define SNP_GAME_PORT_DEFAULT 6112u
+#define SNP_WIRE_HEADER 0x14u          /* header fino a +0x13 (name inizia a +0x14) */
+#define SNP_WIRE_PROBE_LEN 20u
+#define SNP_WIRE_SND_MAX 0x214u        /* buffer annuncio del provider (snp:1D008EAB push 214h) */
+#define SNP_NODE_BYTES 0x13Cu          /* dimensione SnpGame nativa */
+#define SNP_NODE_NAME 0x28u            /* name[128] inline */
+#define SNP_NODE_STAT 0xA8u            /* statstring[128] inline */
+#define SNP_NODE_TTL_MS 10000u         /* snp:1D00904A push 2710h */
+#define SNP_PROBE_MIN_GAP_MS 400u      /* snp:1D009BC4 cmp ecx,190h */
+#define SNP_UNLOCK_POLL_MS 500u        /* snp:1D009BAE mov dword ptr [eax],1F4h */
+#define SNP_WIRE_TYPE_ANNOUNCE 0u
+#define SNP_WIRE_TYPE_WITHDRAW 1u
+#define SNP_WIRE_TYPE_PROBE 2u
+
+/* Campi allineati agli offset provati; gli altri restano zero come li lascia il provider
+ * originale quando non ha il dato (snp:1D008ABD rep stosd). */
+struct SnpGameNode {
+    u32 id;                       /* +0x000 */
+    u32 flags;                    /* +0x004 */
+    u32 field08;                  /* +0x008 */
+    unsigned char host[16];       /* +0x00C host_address inline */
+    u32 field1c;                  /* +0x01C */
+    u32 tick;                     /* +0x020 tick di ricezione (TTL) */
+    u32 elapsed;                  /* +0x024 esposto a Storm, zero in UDP */
+    char name[128];               /* +0x028 */
+    char stat[128];               /* +0x0A8 */
+    struct SnpGameNode *next;     /* +0x128 */
+    unsigned char *blob;          /* +0x12C */
+    u32 blob_len;                 /* +0x130 */
+    u32 product;                  /* +0x134 */
+    u32 version;                  /* +0x138 */
+};
+/* Il compilatore deve vedere esattamente gli offset del binario originale. */
+typedef char snp_node_layout_check[
+    (sizeof(struct SnpGameNode) == SNP_NODE_BYTES &&
+     __builtin_offsetof(struct SnpGameNode, host) == 0x0C &&
+     __builtin_offsetof(struct SnpGameNode, tick) == 0x20 &&
+     __builtin_offsetof(struct SnpGameNode, name) == SNP_NODE_NAME &&
+     __builtin_offsetof(struct SnpGameNode, stat) == SNP_NODE_STAT &&
+     __builtin_offsetof(struct SnpGameNode, next) == 0x128 &&
+     __builtin_offsetof(struct SnpGameNode, blob) == 0x12C &&
+     __builtin_offsetof(struct SnpGameNode, product) == 0x134 &&
+     __builtin_offsetof(struct SnpGameNode, version) == 0x138) ? 1 : -1];
+
+static int g_disc_fd = -1;
+static struct SnpGameNode *g_nodes;
+static u32 g_node_seq;
+static unsigned char g_adv[SNP_WIRE_SND_MAX];
+static u32 g_adv_len;
+static int g_adv_active;
+static u32 g_product = 0x53544152u;   /* 'STAR' (StarCraft.exe 0x004727A2) */
+static u32 g_version = 0xD3u;        /* 0xD3 (StarCraft.exe 0x004727BF) */
+static u32 g_last_probe_ms;
+
+/* Tempo monotono in ms, usato per TTL e cadenza del probe. */
+static u32 snp_now_ms(void) {
+    struct { long sec, nsec; } ts;
+    if (clock_gettime(1 /* CLOCK_MONOTONIC */, &ts) != 0) return 0;
+    return (u32)((unsigned long long)ts.sec * 1000ULL + (unsigned long long)(ts.nsec / 1000000));
+}
+
 extern unsigned int win32_ui_load_library(const char *) __attribute__((weak));
 extern void *arm_bridge_lookup_thunk(const char *) __attribute__((weak));
 
@@ -145,6 +235,45 @@ static u32 parse_port(const char *s) {
     return *s ? 0 : n;
 }
 
+static void peers_clear(void) { g_peer_count = 0; }
+static int snp_trace_on(void);
+static int peers_parse(void) {
+    const char *s = getenv("SC_LAN_PEERS");
+    peers_clear();
+    if (!s || !*s) return 1;
+    while (*s) {
+        char ip[16]; u32 n = 0, port; struct SnpSockaddrIn peer;
+        while (*s && *s != ':' && *s != ',') {
+            if (n + 1 >= sizeof ip) { peers_clear(); return 0; }
+            ip[n++] = *s++;
+        }
+        ip[n] = 0;
+        if (*s++ != ':' || !parse_ipv4(ip, &peer.address)) { peers_clear(); return 0; }
+        { u32 digits = 0; port = 0;
+          while (*s >= '0' && *s <= '9') { port = port * 10u + (u32)(*s++ - '0');
+            if (port > 65535u) { peers_clear(); return 0; } ++digits; }
+          if (!digits || !port || (*s && *s != ',')) { peers_clear(); return 0; }
+        }
+        if (g_peer_count >= SNP_MAX_PEERS) { peers_clear(); return 0; }
+        peer.family = SNP_AF_INET; peer.port = net_port((u16)port);
+        memset(peer.zero, 0, sizeof peer.zero);
+        g_peers[g_peer_count++] = peer;
+        if (*s == ',') { ++s; if (!*s) { peers_clear(); return 0; } }
+    }
+    return 1;
+}
+
+u32 snp_peer_count(void) { return g_peer_count; }
+u32 snp_peers_foreach(int (*callback)(const unsigned char address[16], void *context), void *context) {
+    u32 i, visited = 0;
+    if (!callback) return 0;
+    for (i = 0; i < g_peer_count; ++i) {
+        if (!callback((const unsigned char *)&g_peers[i], context)) break;
+        ++visited;
+    }
+    return visited;
+}
+
 static u32 net_poll_interval_ms(void) {
     const char *s = getenv("SC_NET_POLL_MS");
     u32 n = 0;
@@ -160,7 +289,10 @@ static u32 net_poll_interval_ms(void) {
 static int open_loopback_socket(void) {
     struct SnpSockaddrIn local;
     const char *bind_ip = getenv("SC_LAN_BIND"), *port_env = getenv("SC_LAN_PORT");
-    u32 port = port_env ? parse_port(port_env) : 0;
+    /* Porta di gioco 6112 come il provider originale (snp:1D009E17): i peer memorizzati nella
+     * lista hanno la porta normalizzata a 6112, quindi un socket effimero non riceverebbe il join.
+     * SC_LAN_PORT la sostituisce esplicitamente (utile per due istanze sullo stesso IP). */
+    u32 port = port_env ? parse_port(port_env) : SNP_GAME_PORT_DEFAULT;
     int one = 1, fd;
     if (port_env && !port && !(port_env[0] == '0' && port_env[1] == 0)) { snp_log("[snp] SC_LAN_PORT invalida\\n"); return -1; }
     fd = socket(SNP_AF_INET, SNP_SOCK_DGRAM, 0);
@@ -175,6 +307,306 @@ static int open_loopback_socket(void) {
     g_net_poll_ms = net_poll_interval_ms();
     g_poll_socket_fd = fd;
     g_last_poll_valid = 0;
+    return fd;
+}
+
+static u32 snp_strlen(const char *s) { u32 n = 0; while (s && s[n]) ++n; return n; }
+
+/* ---- wire format, discovery e lista partite --------------------------------------------- */
+static void put16(unsigned char *p, u32 v) { p[0] = (unsigned char)(v & 0xFFu); p[1] = (unsigned char)((v >> 8) & 0xFFu); }
+static void put32(unsigned char *p, u32 v) { p[0] = (unsigned char)(v & 0xFFu); p[1] = (unsigned char)((v >> 8) & 0xFFu);
+                                              p[2] = (unsigned char)((v >> 16) & 0xFFu); p[3] = (unsigned char)((v >> 24) & 0xFFu); }
+static u32 get16(const unsigned char *p) { return (u32)p[0] | ((u32)p[1] << 8); }
+static u32 get32(const unsigned char *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
+
+/* Somma all'indietro modulo 255 (standard.snp 0x1D00F060): alto = s1, basso = s2 % 255. */
+static u16 snp_wire_sum(const unsigned char *base, u32 len) {
+    u32 s1 = 0, s2 = 0;
+    const unsigned char *p;
+    if (!len) return 0;
+    for (p = base + len - 1; len; --len, --p) {
+        s1 += *p;
+        if (s1 >= 0xFFu) s1 -= 255u;
+        s2 += s1;
+    }
+    return (u16)(((s1 & 0xFFu) << 8) | (s2 % 255u));
+}
+/* Sigillo dei due byte a +0x00 sui byte [2..len) (standard.snp 0x1D008BD0). Il mittente
+ * originale scrive (hi = ~(s2%255), lo = ~hi), che NON rende nulla la somma sull'intero
+ * datagramma (verificato numericamente: 2 casi su 168 la soddisfano). Il controllo del
+ * ricevitore originale (`test ax,ax` dopo 0x1D00F060) non e' quindi riproducibile in modo
+ * fedele: qui si valida ricalcolando il sigillo e confrontandolo col campo, che e' esattamente
+ * cio' che scrive un mittente originale. */
+static u16 snp_wire_seal(const unsigned char *base, u32 len) {
+    u32 v1, hi, lo;
+    if (len < 2) return 0;
+    v1 = (u32)(snp_wire_sum(base + 2, len - 2) & 0xFFu);
+    hi = (~v1) & 0xFFu;
+    lo = (~hi) & 0xFFu;
+    return (u16)((hi << 8) | lo);
+}
+static void snp_wire_stamp(unsigned char *base, u32 len) {
+    u16 seal = snp_wire_seal(base, len);
+    base[0] = (unsigned char)(seal & 0xFFu);
+    base[1] = (unsigned char)((seal >> 8) & 0xFFu);
+}
+
+static void addr_set(struct SnpSockaddrIn *a, u32 ip_host_order, u16 port_host_order) {
+    memset(a, 0, sizeof *a);
+    a->family = SNP_AF_INET;
+    a->port = net_port(port_host_order);
+    a->address = ip_host_order;      /* gia' in ordine di rete, come parse_ipv4 */
+}
+
+static int disc_socket(void) { return g_disc_fd; }
+static void disc_poll(void);
+
+static void disc_send_to(const struct SnpSockaddrIn *to, const unsigned char *buf, u32 len) {
+    int rc;
+    static int sent_logged, err_logged;
+    if (g_disc_fd < 0 || !to) return;
+    rc = sendto(g_disc_fd, buf, len, 0, to, sizeof *to);
+    if (snp_trace_on()) {
+        if (rc < 0 && err_logged < 3) {
+            ++err_logged;
+            snp_log("[snp-trace] discovery sendto errno="); reasm_elf_log_hex((u32)(unsigned)*__errno_location());
+            snp_log(" dst="); reasm_elf_log_hex(get32((const unsigned char *)to + 4));
+            snp_log(":"); reasm_elf_log_hex(net_port(to->port)); snp_log("\n");
+        } else if (rc >= 0 && sent_logged < 8) {
+            ++sent_logged;
+            snp_log("[snp-trace] discovery sendto ok dst="); reasm_elf_log_hex(get32((const unsigned char *)to + 4));
+            snp_log(":"); reasm_elf_log_hex(net_port(to->port)); snp_log(" len="); reasm_elf_log_hex(len); snp_log("\n");
+        }
+    }
+}
+
+/* Broadcast di discovery: 255.255.255.255:6111 piu' i peer configurati (porta discovery). */
+static void disc_broadcast(const unsigned char *buf, u32 len) {
+    struct SnpSockaddrIn to;
+    u32 i;
+    addr_set(&to, 0xFFFFFFFFu, (u16)SNP_DISC_PORT_DEFAULT);
+    disc_send_to(&to, buf, len);
+    /* Broadcast limitato all'interfaccia di loopback (127.255.255.255): il broadcast globale non
+     * esce su lo e due istanze sullo stesso host con IP 127.0.0.x non si vedrebbero. Nessun
+     * effetto sulle reti reali (indirizzo di loopback). */
+    addr_set(&to, 0xFFFFFF7Fu, (u16)SNP_DISC_PORT_DEFAULT);
+    disc_send_to(&to, buf, len);
+    for (i = 0; i < g_peer_count; ++i) {
+        to = g_peers[i];
+        to.port = net_port((u16)SNP_DISC_PORT_DEFAULT);
+        disc_send_to(&to, buf, len);
+    }
+    if (snp_trace_on()) {
+        snp_log("[snp-trace] discovery tx len="); reasm_elf_log_hex(len);
+        snp_log(" peers="); reasm_elf_log_hex(g_peer_count); snp_log("\n");
+    }
+}
+
+static void node_free(struct SnpGameNode *n) {
+    if (!n) return;
+    free(n->blob);
+    free(n);
+}
+static void nodes_clear(void) {
+    struct SnpGameNode *n = g_nodes;
+    while (n) { struct SnpGameNode *next = n->next; node_free(n); n = next; }
+    g_nodes = 0;
+}
+static void nodes_purge(u32 now) {
+    struct SnpGameNode **link = &g_nodes;
+    while (*link) {
+        struct SnpGameNode *n = *link;
+        if (now - n->tick > SNP_NODE_TTL_MS) {   /* snp:1D008719-1D008725, confronto unsigned */
+            *link = n->next;
+            if (snp_trace_on()) { snp_log("[snp-trace] purge game: "); snp_log(n->name); snp_log("\n"); }
+            node_free(n);
+            continue;
+        }
+        link = &n->next;
+    }
+}
+static int node_key_equal(const unsigned char *a, const struct SnpSockaddrIn *b) {
+    return memcmp(a, b, 12) == 0;    /* family+porta+indirizzo; padding non significativo */
+}
+static struct SnpGameNode *node_find(const struct SnpSockaddrIn *host) {
+    struct SnpGameNode *n;
+    for (n = g_nodes; n; n = n->next) if (node_key_equal(n->host, host)) return n;
+    return 0;
+}
+static void node_remove(const struct SnpSockaddrIn *host) {
+    struct SnpGameNode **link = &g_nodes;
+    while (*link) {
+        if (node_key_equal((*link)->host, host)) {
+            struct SnpGameNode *dead = *link;
+            *link = dead->next;
+            if (snp_trace_on()) { snp_log("[snp-trace] withdraw game: "); snp_log(dead->name); snp_log("\n"); }
+            node_free(dead);
+            return;
+        }
+        link = &(*link)->next;
+    }
+}
+/* Inserimento/aggiornamento di una voce dalla forma wire (snp:1D008B7F-1D008B9E). */
+static void node_upsert(const struct SnpSockaddrIn *host, const unsigned char *wire, u32 len, u32 now) {
+    struct SnpGameNode *n = node_find(host);
+    const unsigned char *name, *stat, *blob;
+    u32 blob_len = 0;
+    if (len < SNP_WIRE_HEADER) return;
+    name = wire + SNP_WIRE_HEADER;
+    stat = name;
+    while ((u32)(stat - wire) < len && *stat) ++stat;
+    if ((u32)(stat - wire) >= len) return;
+    ++stat;
+    blob = stat;
+    while ((u32)(blob - wire) < len && *blob) ++blob;
+    if ((u32)(blob - wire) >= len) return;
+    ++blob;
+    if ((u32)(blob - wire) <= len) blob_len = len - (u32)(blob - wire);
+    if (!n) {
+        n = (struct SnpGameNode *)malloc(sizeof *n);
+        if (!n) return;
+        memset(n, 0, sizeof *n);
+        n->id = ++g_node_seq ? g_node_seq : ++g_node_seq;
+        n->next = g_nodes;
+        g_nodes = n;
+    } else {
+        free(n->blob); n->blob = 0; n->blob_len = 0;
+    }
+    memset(n->host, 0, sizeof n->host);
+    memcpy(n->host, host, 12);
+    n->flags = get32(wire + 0x10);
+    n->tick = now;
+    n->product = get32(wire + 0x08);
+    n->version = get32(wire + 0x0C);
+    { u32 i; for (i = 0; i + 1 < sizeof n->name; ++i) { char c = (char)name[i]; n->name[i] = c; if (!c) break; } n->name[sizeof n->name - 1] = 0; }
+    { u32 i; for (i = 0; i + 1 < sizeof n->stat; ++i) { char c = (char)stat[i]; n->stat[i] = c; if (!c) break; } n->stat[sizeof n->stat - 1] = 0; }
+    if (blob_len) {
+        n->blob = (unsigned char *)malloc(blob_len);
+        if (n->blob) { memcpy(n->blob, blob, blob_len); n->blob_len = blob_len; }
+    }
+    if (snp_trace_on()) {
+        snp_log("[snp-trace] game list +: "); snp_log(n->name);
+        snp_log(" stat="); snp_log(n->stat); reasm_elf_log_hex(n->blob_len); snp_log("\n");
+    }
+}
+
+/* Costruzione dell'annuncio (tipo 0): header + name\0 statstring\0 blob. */
+static u32 wire_build_announce(unsigned char *buf, u32 cap, const char *name, const char *stat,
+                               u32 flags, const unsigned char *blob, u32 blob_len) {
+    u32 nlen, slen, len;
+    if (!buf) return 0;
+    nlen = snp_strlen(name);
+    slen = snp_strlen(stat);
+    if (nlen > 127u) nlen = 127u;
+    if (slen > 127u) slen = 127u;
+    if (blob_len > cap) return 0;
+    len = SNP_WIRE_HEADER + nlen + 1u + slen + 1u + blob_len;
+    if (len > cap) return 0;
+    memset(buf, 0, SNP_WIRE_HEADER);
+    put16(buf + 0x00, 0);
+    put16(buf + 0x02, len);
+    put16(buf + 0x04, SNP_WIRE_TYPE_ANNOUNCE);
+    put16(buf + 0x06, 0);
+    put32(buf + 0x08, g_product);
+    put32(buf + 0x0C, g_version);
+    put32(buf + 0x10, flags);
+    if (nlen) memcpy(buf + SNP_WIRE_HEADER, name, nlen);
+    buf[SNP_WIRE_HEADER + nlen] = 0;
+    if (slen) memcpy(buf + SNP_WIRE_HEADER + nlen + 1u, stat, slen);
+    buf[SNP_WIRE_HEADER + nlen + 1u + slen] = 0;
+    if (blob_len) memcpy(buf + SNP_WIRE_HEADER + nlen + 1u + slen + 1u, blob, blob_len);
+    snp_wire_stamp(buf, len);
+    return len;
+}
+
+static u32 wire_build_probe(unsigned char *buf, u32 cap) {
+    if (!buf || cap < SNP_WIRE_PROBE_LEN) return 0;
+    memset(buf, 0, SNP_WIRE_PROBE_LEN);
+    put16(buf + 0x02, SNP_WIRE_PROBE_LEN);
+    put16(buf + 0x04, SNP_WIRE_TYPE_PROBE);
+    put32(buf + 0x08, g_product);
+    put32(buf + 0x0C, g_version);
+    snp_wire_stamp(buf, SNP_WIRE_PROBE_LEN);
+    return SNP_WIRE_PROBE_LEN;
+}
+
+static void snp_send_probe(void) {
+    unsigned char probe[SNP_WIRE_PROBE_LEN];
+    u32 len = wire_build_probe(probe, sizeof probe);
+    if (!len) return;
+    g_last_probe_ms = snp_now_ms();
+    disc_broadcast(probe, len);
+}
+
+/* Ricezione discovery: tipo 0 annuncio, 1 ritiro, 2 probe (risposta unicast). */
+static void disc_handle(const unsigned char *buf, u32 len, const struct SnpSockaddrIn *from) {
+    u32 type;
+    struct SnpSockaddrIn key;
+    u32 now = snp_now_ms();
+    if (len < SNP_WIRE_PROBE_LEN) return;
+    if (get16(buf + 0x02) != len) return;
+    if (get16(buf) != snp_wire_seal(buf, len)) {
+        if (snp_trace_on()) snp_log("[snp-trace] discovery scartato: checksum\n");
+        return;
+    }
+    type = get16(buf + 0x04);
+    if (type == SNP_WIRE_TYPE_PROBE) {
+        if (g_adv_active && g_adv_len) disc_send_to(from, g_adv, g_adv_len);
+        return;
+    }
+    if (type != SNP_WIRE_TYPE_ANNOUNCE && type != SNP_WIRE_TYPE_WITHDRAW) return;
+    /* Chiave = sockaddr_in con porta normalizzata a 6112 (snp:1D0089B6). */
+    key = *from;
+    key.port = net_port((u16)SNP_GAME_PORT_DEFAULT);
+    if (type == SNP_WIRE_TYPE_WITHDRAW) node_remove(&key);
+    else node_upsert(&key, buf, len, now);
+}
+
+static void disc_poll(void) {
+    unsigned char buf[SNP_WIRE_SND_MAX];
+    struct SnpSockaddrIn from;
+    u32 guard = 0;
+    static int rx_logged, err_logged;
+    while (g_disc_fd >= 0 && guard++ < 64u) {
+        unsigned int from_bytes = sizeof from;
+        int n = recvfrom(g_disc_fd, buf, sizeof buf, SNP_MSG_DONTWAIT, &from, &from_bytes);
+        if (n <= 0 || from_bytes != sizeof from) {
+            if (n < 0 && snp_trace_on() && err_logged < 3) {
+                ++err_logged;
+                snp_log("[snp-trace] discovery recv errno="); reasm_elf_log_hex((u32)(unsigned)*__errno_location());
+                snp_log("\n");
+            }
+            break;
+        }
+        if (snp_trace_on() && rx_logged < 12) {
+            ++rx_logged;
+            snp_log("[snp-trace] discovery rx len="); reasm_elf_log_hex((u32)n);
+            snp_log(" type="); reasm_elf_log_hex(get16(buf + 0x04));
+            snp_log(" declared="); reasm_elf_log_hex(get16(buf + 0x02));
+            snp_log(" seal="); reasm_elf_log_hex(get16(buf));
+            snp_log(" calc="); reasm_elf_log_hex((u32)snp_wire_seal(buf, (u32)n));
+            snp_log("\n");
+        }
+        disc_handle(buf, (u32)n, &from);
+    }
+    nodes_purge(snp_now_ms());
+}
+
+static int open_discovery_socket(void) {
+    struct SnpSockaddrIn local;
+    const char *bind_ip = getenv("SC_LAN_BIND");
+    const char *port_env = getenv("SC_DISC_PORT");
+    u32 port = port_env ? parse_port(port_env) : SNP_DISC_PORT_DEFAULT;
+    int one = 1, fd;
+    if (port_env && !port) { snp_log("[snp] SC_DISC_PORT invalida\n"); return -1; }
+    fd = socket(SNP_AF_INET, SNP_SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    addr_set(&local, 0x0100007fu, (u16)port);
+    if (bind_ip && !parse_ipv4(bind_ip, &local.address)) { close(fd); return -1; }
+    (void)setsockopt(fd, SNP_SOL_SOCKET, SNP_SO_BROADCAST, &one, sizeof one);
+    if (bind(fd, &local, sizeof local) != 0) { close(fd); return -1; }
+    { int flags = fcntl(fd, SNP_F_GETFL, 0);
+      if (flags < 0 || fcntl(fd, SNP_F_SETFL, flags | SNP_O_NONBLOCK) < 0) { close(fd); return -1; } }
     return fd;
 }
 
@@ -194,7 +626,7 @@ int REASM_STDCALL SnpQuery(u32 index, u32 *code, char **name, char **description
     *description = (char *) g_profiles[index].description;
     *caps = &g_caps;
     snp_log(index == 0 ? "[snp] SnpQuery index=0 -> Native POSIX Loopback\n" :
-                        "[snp] SnpQuery index=1 -> Local Area Network (UDP), loopback-only backend\n");
+                        "[snp] SnpQuery index=1 -> Local Area Network (UDP), configured IPv4 peer transport\n");
     return 1;
 }
 
@@ -211,8 +643,17 @@ struct SnpLocalGame {
 static struct SnpLocalGame g_game;
 
 int REASM_STDCALL snp_stop_advertising(void) {
+    /* Slot +0x44, 0 argomenti (storm:1503AAE8). Invia il ritiro (tipo 1) con la STESSA lunghezza
+     * dell'annuncio e ricalcola il sigillo (standard.snp 0x1D008DAC/1D008E11). */
+    if (g_adv_active && g_adv_len) {
+        put16(g_adv + 0x04, SNP_WIRE_TYPE_WITHDRAW);
+        snp_wire_stamp(g_adv, g_adv_len);
+        disc_broadcast(g_adv, g_adv_len);
+        if (snp_trace_on()) { snp_log("[snp-trace] withdraw tx len="); reasm_elf_log_hex(g_adv_len); snp_log("\n"); }
+    }
+    g_adv_active = 0; g_adv_len = 0;
     g_game.used = 0;
-    snp_log("[snp] spiStopAdvertisingGame -> gioco locale rimosso\n");
+    snp_log("[snp] spiStopAdvertisingGame -> ritiro inviato, annuncio liberato\n");
     return 1;
 }
 int REASM_STDCALL snp_compare_addresses(struct SnpNetAddress *a, struct SnpNetAddress *b, u32 *differences) {
@@ -240,8 +681,13 @@ int REASM_STDCALL snp_get_performance_data(u32 provider, u32 *out, void *file_ti
 }
 
 int REASM_STDCALL snp_destroy(void) {
+    g_poll_thread_stop = 1;
     if (g_socket_fd >= 0) { close(g_socket_fd); g_socket_fd = -1; }
-    snp_log("[snp] spiDestroy -> FALSE (cleanup attempted; return ignored by Storm)\n");
+    if (g_disc_fd >= 0) { close(g_disc_fd); g_disc_fd = -1; }
+    nodes_clear();
+    g_adv_active = 0; g_adv_len = 0;
+    g_receive_event = 0; g_event_packet_pending = 0; peers_clear();
+    snp_log("[snp] spiDestroy -> cleanup eseguito (valore di ritorno ignorato da Storm)\n");
     return 0;
 }
 
@@ -259,14 +705,73 @@ int REASM_STDCALL snp_free_external(struct SnpNetAddress *address, char *data, u
     return 0;
 }
 
+static int snp_signal_event(void) {
+    if (!g_receive_event) return 0;
+    if (!SetEvent) { snp_log("[snp] SetEvent non disponibile: event wakeup negato\n"); return 0; }
+    if (!SetEvent((void *)(unsigned long)g_receive_event)) {
+        snp_log("[snp] SetEvent ha rifiutato l'HANDLE guest (nessun thunk/handle conversion applicato)\n");
+        return 0;
+    }
+    return 1;
+}
+
+static void *snp_event_poll_thread(void *unused) {
+    char byte;
+    (void)unused;
+    while (!__atomic_load_n(&g_poll_thread_stop, __ATOMIC_RELAXED)) {
+        int fd = __atomic_load_n(&g_socket_fd, __ATOMIC_RELAXED);
+        if (fd >= 0 && g_receive_event) {
+            int n = recvfrom(fd, &byte, 1, SNP_MSG_DONTWAIT | 0x02 /* MSG_PEEK */, 0, 0);
+            if (n >= 0 && !__atomic_exchange_n(&g_event_packet_pending, 1, __ATOMIC_RELAXED))
+                (void)snp_signal_event();
+        }
+        { static unsigned tick;
+          if ((tick++ % 10u) == 0u && disc_socket() >= 0) disc_poll();
+          { struct { long sec, nsec; } delay = { 0, 1000000L }; (void)nanosleep(&delay, 0); } }
+    }
+    __atomic_store_n(&g_poll_thread_running, 0, __ATOMIC_RELAXED);
+    return 0;
+}
+
 int REASM_STDCALL snp_initialize(void *client, void *user, void *battle, void *module, u32 event) {
-    (void) client; (void) user; (void) battle; (void) module; (void) event;
+    (void) user; (void) battle; (void) module;
+    g_receive_event = event;
+    g_event_packet_pending = 0;
+    /* Product ID e versione arrivano dal record del client (standard.snp 0x1D009C7C/0x1D009C7F
+     * legge +0x0C e +0x10 del primo argomento); accettati solo valori plausibili. */
+    if (client) {
+        u32 prod = *(const u32 *)((const unsigned char *)client + 0x0C);
+        u32 ver = *(const u32 *)((const unsigned char *)client + 0x10);
+        if (prod == 0x53544152u || prod == 0x53455850u) g_product = prod;
+        if (ver && ver < 0x10000u) g_version = ver;
+    }
+    if (!peers_parse()) snp_log("[snp] SC_LAN_PEERS non valida: peer list vuota (attesi IPv4:porta numerici)\n");
+    if (snp_trace_on()) {
+        snp_log("[snp-trace] SC_LAN_PEERS count="); reasm_elf_log_hex(g_peer_count);
+        snp_log(" product="); reasm_elf_log_hex(g_product);
+        snp_log(" version="); reasm_elf_log_hex(g_version); snp_log("\n");
+    }
     if (g_socket_fd < 0) g_socket_fd = open_loopback_socket();
     if (g_socket_fd < 0) {
         snp_log("[snp] spiInitialize failed: loopback UDP bind failed\n");
         return 0;
     }
-    snp_log("[snp] spiInitialize bound real UDP socket to 127.0.0.1\n");
+    /* Socket di discovery separato (6111), come il provider originale (0x1D009D39-1D009E6D).
+     * Se la porta e' occupata si continua senza discovery e lo si dichiara nel log. */
+    if (g_disc_fd < 0) {
+        g_disc_fd = open_discovery_socket();
+        if (g_disc_fd < 0) snp_log("[snp] discovery socket non disponibile (porta occupata?): GameList solo via SC_LAN_PEERS\n");
+        else snp_log("[snp] discovery socket bound su porta 6111\n");
+    }
+    if (g_receive_event && SetEvent && !__atomic_load_n(&g_poll_thread_running, __ATOMIC_RELAXED)) {
+        g_poll_thread_stop = 0;
+        if (pthread_create(&g_poll_thread, 0, snp_event_poll_thread, 0) == 0) {
+            __atomic_store_n(&g_poll_thread_running, 1, __ATOMIC_RELAXED);
+            (void)pthread_detach(g_poll_thread);
+        } else snp_log("[snp] poll thread non avviato: event wakeup limitato a spiReceive\n");
+    }
+    snp_log("[snp] spiInitialize bound real UDP socket\n");
+    if (event == 0) snp_log("[snp] spiInitialize event=0: event wakeup disabilitato (Storm ha passato NULL)\n");
     return 1;
 }
 
@@ -295,16 +800,33 @@ int REASM_STDCALL snp_unlock_device_list(void *devices) {
 
 int REASM_STDCALL snp_lock_game_list(int flags, int reserved, struct SnpGame **games) {
     (void)flags; (void)reserved;
-    if (!games || g_socket_fd < 0) return 0;
-    /* SnpGame/GAMELIST layout is not established from the provider ABI: fail closed rather than
-     * hand Storm an invented record. UDP game discovery is not yet advertised as game listing. */
-    *games = 0;
-    snp_log("[snp] spiLockGameList -> TRUE, empty (SnpGame layout UNKNOWN)\n");
+    if (!games) return 0;
+    /* Slot +0x28, 3 argomenti (storm:15038A88). Lock restituisce un PRESTITO della testa;
+     * l'ownership dei nodi resta del provider (purge/replace/teardown). */
+    disc_poll();
+    *games = (struct SnpGame *)g_nodes;
+    if (snp_trace_on()) {
+        u32 count = 0; struct SnpGameNode *n;
+        for (n = g_nodes; n; n = n->next) ++count;
+        snp_log("[snp-trace] spiLockGameList head="); reasm_elf_log_hex((u32)(unsigned long)g_nodes);
+        snp_log(" count="); reasm_elf_log_hex(count); snp_log("\n");
+    }
     return 1;
 }
 
 int REASM_STDCALL snp_unlock_game_list(struct SnpGame *games, u32 *reserved) {
-    (void)games; (void)reserved;
+    u32 now;
+    /* Slot +0x4c, 2 argomenti (storm:15038B62). Se il chiamante fornisce un indirizzo, il
+     * provider scrive il poll hint di 500 ms e - solo con un annuncio locale attivo o con la
+     * lista non vuota - emette un probe se sono passati piu' di 400 ms (0x1D009BAE/1D009BC4). */
+    disc_poll();
+    now = snp_now_ms();
+    if (reserved) *reserved = SNP_UNLOCK_POLL_MS;
+    /* Il provider originale emette il probe quando Unlock riceve un indirizzo, senza guardare
+     * se la lista locale e' vuota (0x1D009BAE-0x1D009BD1): un client senza voci deve comunque
+     * cercare i giochi. Qui si rispetta la stessa cadenza minima di 400 ms. */
+    if (reserved && (u32)(now - g_last_probe_ms) > SNP_PROBE_MIN_GAP_MS)
+        snp_send_probe();
     return 1;
 }
 
@@ -346,10 +868,13 @@ static int receive_packet(struct SnpNetAddress **address, char **data, u32 *byte
     packet->bytes = (u32)n;
     for (i = 0; i < (u32)n; ++i) packet->data[i] = payload[i];
     *address = &packet->address; *data = packet->data; *bytes = (u32)n;
+    __atomic_store_n(&g_event_packet_pending, 0, __ATOMIC_RELAXED);
+    (void)snp_signal_event();
     return 1;
 }
 
 int REASM_STDCALL snp_receive(struct SnpNetAddress **address, char **data, u32 *bytes) {
+    if (disc_socket() >= 0) disc_poll();
     return receive_packet(address, data, bytes);
 }
 
@@ -367,8 +892,12 @@ int REASM_STDCALL snp_initialize_device(void *a1, void *a2, void *a3, void *a4, 
     return 0;
 }
 
-int REASM_STDCALL snp_unknown_select_game(void) {
-    snp_log("[snp] spiSelectGame non implementata -> FALSE (ABI/call-site UNKNOWN)\n");
+int REASM_STDCALL snp_unknown_select_game(void *a1, void *a2, void *a3, void *a4, void *a5, void *a6) {
+    (void) a1; (void) a2; (void) a3; (void) a4; (void) a5; (void) a6;
+    /* Slot +0x34: 6 argomenti stdcall, `ret 0x18` (storm:15039044/1503906A, snp:1D009C5D).
+     * La semantica del dialogo e' provata solo in parte: resta fail-closed con arita' corretta,
+     * per non sporcare lo stack del chiamante. Implementazione completa: task LAN-3. */
+    snp_log("[snp] spiSelectGame -> FALSE (6 argomenti, semantica del dialogo non implementata)\n");
     return 0;
 }
 int REASM_STDCALL snp_unknown_report_result(void) {
@@ -376,18 +905,20 @@ int REASM_STDCALL snp_unknown_report_result(void) {
     return 0;
 }
 int REASM_STDCALL snp_send(u32 count, struct SnpNetAddress **addresses, char *data, u32 bytes) {
-    u32 i;
+    u32 i, targets_count = count ? count : g_peer_count;
     int sent_any = 0;
-    if (!count || !addresses || !data || bytes > SNP_MAX_DATAGRAM || g_socket_fd < 0) return 0;
+    if ((!count && !g_peer_count) || (count && !addresses) || !data || bytes > SNP_MAX_DATAGRAM || g_socket_fd < 0) return 0;
+    if (snp_trace_on()) { snp_log("[snp-trace] spiSend count="); reasm_elf_log_hex(count);
+        snp_log(" fanout="); reasm_elf_log_hex(count ? 0 : g_peer_count); snp_log("\n"); }
     /* The pointer/array/count prototype matches the provider table. Address bytes are treated as
      * the 16-byte sockaddr_in form requested for the LAN adapter; native live compatibility with
      * Storm's SNETADDR has not yet been established. */
-    for (i = 0; i < count; ++i) {
+    for (i = 0; i < targets_count; ++i) {
         struct SnpSockaddrIn to;
         const unsigned char *src;
         u32 j;
-        if (!addresses[i]) return 0;
-        src = addresses[i]->bytes;
+        if (!count) src = (const unsigned char *)&g_peers[i];
+        else { if (!addresses[i]) return 0; src = addresses[i]->bytes; }
         for (j = 0; j < 16; ++j) ((unsigned char *)&to)[j] = src[j];
         if (to.family != SNP_AF_INET || !to.port || !to.address) return 0;
         if (sendto(g_socket_fd, data, bytes, 0, &to, sizeof to) != (int)bytes) return 0;
@@ -403,26 +934,40 @@ int REASM_STDCALL snp_send_external(void *a1, void *a2, void *a3, void *a4, void
 /* Storm #138 usa QUESTO slot (+0x40) per il gioco single player: 10 argomenti, e il valore di
  * ritorno e' testato dal chiamante (0x1503B0A2). Registriamo il gioco locale: nessun dato di rete
  * e' fabbricato, nessun peer remoto esiste. */
-int REASM_STDCALL snp_start_advertising_ladder(void *a1, void *a2, void *a3, void *a4, void *a5,
-                                                       void *a6, void *a7, void *a8, void *a9, void *a10) {
-    (void) a1; (void) a2; (void) a3; (void) a4; (void) a5;
-    (void) a6; (void) a7; (void) a8; (void) a9; (void) a10;
-    g_game.used = 1; g_game.flags = 1;
-    g_game.name[0] = 0;
-    snp_log("[snp] spiStartAdvertisingLadderGame -> gioco locale registrato (+0x40)\n");
+/* Slot +0x40: advertising vero, 10 argomenti (`ret 0x28`), storm:15037BF8 e snp:1D008E70.
+ * Ordine provato: name, optstr, statstring, flags, elapsed, d1, d2, d3, blob, blob_len. */
+int REASM_STDCALL snp_start_advertising_ladder(const char *name, const char *optstr, const char *stat,
+                                               u32 flags, u32 elapsed, u32 d1, u32 d2, u32 d3,
+                                               const unsigned char *blob, u32 blob_len) {
+    u32 len;
+    (void) optstr; (void) elapsed; (void) d1; (void) d2; (void) d3;
+    if (!name) name = "";
+    if (!stat) stat = "";
+    if (!blob) blob_len = 0;
+    len = wire_build_announce(g_adv, sizeof g_adv, name, stat, flags, blob, blob_len);
+    if (!len) {
+        snp_log("[snp] spiStartAdvertisingGame -> FALSE (annuncio troppo grande)\n");
+        return 0;
+    }
+    g_adv_len = len;
+    g_adv_active = 1;
+    g_game.used = 1; g_game.flags = flags;
+    { u32 i; for (i = 0; i + 1 < sizeof g_game.name && name[i]; ++i) g_game.name[i] = name[i]; g_game.name[i] = 0; }
+    disc_broadcast(g_adv, len);
+    if (snp_trace_on()) {
+        snp_log("[snp-trace] announce tx name="); snp_log(g_game.name);
+        snp_log(" len="); reasm_elf_log_hex(len); snp_log("\n");
+    }
+    snp_log("[snp] spiStartAdvertisingGame -> annuncio inviato (discovery 6111)\n");
     return 1;
 }
-int REASM_STDCALL snp_start_advertising(const char *name, u32 name_bytes, const char *password, u32 password_bytes) {
-    u32 i;
-    (void) password; (void) password_bytes;
-    for (i = 0; i + 1 < sizeof g_game.name && name && i < name_bytes && name[i]; ++i)
-        g_game.name[i] = name[i];
-    g_game.name[i] = 0;
-    g_game.used = 1; g_game.flags = 0;
-    snp_log("[snp] spiStartAdvertisingGame -> gioco locale registrato: ");
-    snp_log(g_game.name);
-    snp_log("\n");
-    return 1;
+/* Slot +0x50: NON e' l'advertising. Contratto provato: 4 argomenti con due buffer di OUTPUT da
+ * 128 byte (storm:1503AF1E/1503AF3A); la semantica delle stringhe non e' dimostrata, quindi resta
+ * fail-closed e NON legge i buffer come input. */
+int REASM_STDCALL snp_start_advertising(void *buf1, u32 len1, void *buf2, u32 len2) {
+    (void) buf1; (void) len1; (void) buf2; (void) len2;
+    snp_log("[snp] slot +0x50 (stringhe locali) -> FALSE (semantica non provata)\n");
+    return 0;
 }
 void REASM_STDCALL snp_check_data_file(void *a1, u32 a2, u32 a3, u32 *available) {
     (void) a1; (void) a2; (void) a3;
@@ -525,7 +1070,7 @@ int REASM_STDCALL SnpBind(u32 index, struct SnpNetFunctions **out_functions) {
     }
     *out_functions = fns;
     snp_log(index == 0 ? "[snp] SnpBind index=0 -> NetFunctions size=0x70\n" :
-                        "[snp] SnpBind index=1 -> UDP NetFunctions size=0x70 (loopback-only)\n");
+                        "[snp] SnpBind index=1 -> UDP NetFunctions size=0x70 (configured IPv4 peers)\n");
     return 1;
 }
 
@@ -635,7 +1180,6 @@ static void snp_put32(unsigned char *p, u32 v) {
     p[2] = (unsigned char) (v >> 16); p[3] = (unsigned char) (v >> 24);
 }
 
-static u32 snp_strlen(const char *s) { u32 n = 0; while (s[n]) ++n; return n; }
 
 /* Costruisce l'MPQ del nostro modulo con due file:
  *   caps.dat     -> due entry di provider (id 0 single player, id UDP multiplayer)

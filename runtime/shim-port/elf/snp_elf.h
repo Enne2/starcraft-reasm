@@ -18,6 +18,14 @@ void  win32_snp_vfile_close(void *handle);
 /* Solo per il gate: blob MPQ generato (caps.dat con id 0). */
 const unsigned char *snp_elf_caps_mpq(unsigned int *bytes);
 
+/* Configured IPv4 UDP peers from SC_LAN_PEERS. Callback address is the 16-byte
+ * sockaddr_in wire-compatible record used by this provider; nonzero callback
+ * continues iteration. These helpers expose parsed peers to LAN beacon code. */
+typedef unsigned int snp_peer_count_t;
+typedef int (*snp_peer_callback)(const unsigned char address[16], void *context);
+snp_peer_count_t snp_peer_count(void);
+snp_peer_count_t snp_peers_foreach(snp_peer_callback callback, void *context);
+
 /* Focused gate helpers for a real socket created by spiInitialize. */
 int snp_elf_test_socket_address(void *out, unsigned int bytes);
 int snp_elf_test_socket_roundtrip(void);
