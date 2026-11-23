@@ -195,10 +195,21 @@ static u32 buffer_range_remove(void *pixels) {
         if (g_buffer_ranges[i].pixels==pixels) { u32 bytes=g_buffer_ranges[i].bytes; g_buffer_ranges[i].pixels=0; g_buffer_ranges[i].bytes=0; return bytes; }
     return 0;
 }
+/* storm passa a SmackToBuffer un puntatore che puo' stare DENTRO il buffer aperto da
+ * SmackBufferOpen (dest = base + px0/dst0 del rettangolo, vedi log x86:
+ * "dest=0x2055008C pitch=0xB8 rows=0x80 px0=0x2A dst0=0x2A"). Il confronto esatto faceva
+ * fallire i film con rettangolo offset (briefing/campagna) marcandoli BAD: il frame veniva
+ * scartato e il video restava nero. Qui si accetta ogni puntatore dentro un range noto e si
+ * restituiscono i byte RESIDUI da quel puntatore, cosi' il controllo anti-overrun resta valido. */
 static u32 buffer_range_size(void *pixels) {
     unsigned i;
-    for (i=0;i<sizeof g_buffer_ranges/sizeof g_buffer_ranges[0];++i)
-        if (g_buffer_ranges[i].pixels==pixels) return g_buffer_ranges[i].bytes;
+    uintptr_t p = (uintptr_t) pixels;
+    for (i=0;i<sizeof g_buffer_ranges/sizeof g_buffer_ranges[0];++i) {
+        uintptr_t base = (uintptr_t) g_buffer_ranges[i].pixels;
+        if (!base) continue;
+        if (p >= base && p - base < g_buffer_ranges[i].bytes)
+            return (u32) (g_buffer_ranges[i].bytes - (p - base));
+    }
     return 0;
 }
 
@@ -767,6 +778,7 @@ static void SMK_STDCALL SmackToBuffer(void *smk, u32 left, u32 top, u32 pitch, u
     u32 *o = (u32 *) smk;
     const u8 *px;
     u32 rows;
+    static u32 c_autoreg;
     if (!active() || !o) return;
     priv(o)[SMK_PRIV_DEST / 4] = (u32) (ulong) dest;
     priv(o)[SMK_PRIV_PITCH / 4] = pitch;
@@ -775,9 +787,28 @@ static void SMK_STDCALL SmackToBuffer(void *smk, u32 left, u32 top, u32 pitch, u
     priv(o)[SMK_PRIV_DEST_BYTES / 4] = dest ? buffer_range_size(dest) : 0;
     priv(o)[SMK_PRIV_BAD / 4] = flags != 0 || !dest;
     if (dest && !priv(o)[SMK_PRIV_DEST_BYTES / 4]) {
-        priv(o)[SMK_PRIV_BAD / 4] = 1;
-        log2("[smack] ToBuffer destinazione non registrata: ", "scrittura rifiutata");
-    } else if (dest && pitch && destheight && (ulong)pitch * destheight > priv(o)[SMK_PRIV_DEST_BYTES / 4]) {
+        /* Destinazione non aperta da SmackBufferOpen: storm/gioco possono passare un buffer proprio
+         * (o un buffer gia' chiuso e riusato). Rifiutarla significa NON scrivere alcun frame e
+         * mostrare il video nero: la si registra qui (col limite dichiarato dal chiamante) e la
+         * validazione anti-overrun resta attiva sui byte dichiarati. */
+        ulong need = (ulong) pitch * destheight;
+        if (pitch && destheight && need && need <= 640ul * 480ul * 2ul &&
+            buffer_range_add(dest, (u32) need)) {
+            priv(o)[SMK_PRIV_DEST_BYTES / 4] = (u32) need;
+            if (c_autoreg++ < 2) {
+                reasm_elf_log("[smack] ToBuffer destinazione registrata al volo: ");
+                reasm_elf_log_hex((u32) (ulong) dest); reasm_elf_log(" byte=");
+                reasm_elf_log_hex((u32) need); reasm_elf_log("\n");
+            }
+        } else {
+            priv(o)[SMK_PRIV_BAD / 4] = 1;
+            reasm_elf_log("[smack] ToBuffer destinazione rifiutata: ");
+            reasm_elf_log_hex((u32) (ulong) dest); reasm_elf_log(" pitch=");
+            reasm_elf_log_hex(pitch); reasm_elf_log(" dh="); reasm_elf_log_hex(destheight);
+            reasm_elf_log("\n");
+        }
+    }
+    if (dest && pitch && destheight && (ulong)pitch * destheight > priv(o)[SMK_PRIV_DEST_BYTES / 4]) {
         priv(o)[SMK_PRIV_BAD / 4] = 1;
         reasm_elf_log("[smack] ToBuffer fuori buffer: bytes/pitch/height=");
         reasm_elf_log_hex(priv(o)[SMK_PRIV_DEST_BYTES / 4]); reasm_elf_log_hex(pitch); reasm_elf_log_hex(destheight); reasm_elf_log("\\n");

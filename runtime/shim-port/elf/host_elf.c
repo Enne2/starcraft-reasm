@@ -17,6 +17,10 @@
 #include "win32_shim.h"         /* timer Win32: consegna dei TIMERPROC dal pump */
 #include "sc_ctl.h"              /* API di automazione in-process */
 #include <sys/stat.h>              /* identita' del control-file e rilevamento rotazione */
+#if defined(__arm__)
+#include <signal.h>
+#include <ucontext.h>
+#endif
 
 /* ---- libc dinamica (niente header: si resta freestanding) ---- */
 extern void *malloc(unsigned long);
@@ -33,6 +37,12 @@ extern long atol(const char *);
 extern int open(const char *, int, ...);
 extern long read(int, void *, unsigned long);
 extern int close(int);
+#if defined(__arm__)
+extern void *mmap(void *, unsigned long, int, int, int, long);
+extern int munmap(void *, unsigned long);
+extern int mprotect(void *, unsigned long, int);
+extern void _exit(int);
+#endif
 extern void win32_input_pump(void) __attribute__((weak));
 
 /* ---- API SDL2 usate (verificate con `nm -D` su /lib/libSDL2-2.0.so.0) ---- */
@@ -149,6 +159,15 @@ typedef struct { unsigned int type; unsigned char pad[60]; } SDL_EventBuf;
 static void *g_win;
 static unsigned char *g_canvas;
 static int g_w, g_h, g_pitch, g_bpp;
+volatile unsigned int g_canvas_write_ticks;
+#if defined(__arm__)
+static unsigned long g_canvas_map_size;
+static int g_canvas_is_mmap;
+static struct sigaction g_canvas_watch_old_action;
+static volatile sig_atomic_t g_canvas_watch_armed, g_canvas_watch_fired;
+static unsigned long g_canvas_watch_lo, g_canvas_watch_hi;
+static unsigned int g_canvas_watch_guest_ip;
+#endif
 static int g_locked;
 static int g_inited;
 static int g_audio_inited;
@@ -392,19 +411,87 @@ int host_elf_init(const char *title) {
     return 0;
 }
 
+#if defined(__arm__)
+static void canvas_watch_sigsegv(int sig, siginfo_t *info, void *context) {
+    unsigned long fault=(unsigned long)(info ? info->si_addr : 0);
+    if (g_canvas_watch_armed && fault>=g_canvas_watch_lo && fault<g_canvas_watch_hi) {
+        ucontext_t *uc=(ucontext_t *)context;
+        unsigned long pc=uc ? uc->uc_mcontext.arm_pc : 0;
+        (void)mprotect(g_canvas,(unsigned long)g_canvas_map_size,3 /* PROT_READ|PROT_WRITE */);
+        g_canvas_watch_armed=0;
+        g_canvas_watch_fired=1;
+        reasm_elf_log("[canvas-watch] write fault addr="); reasm_elf_log_hex((unsigned)fault);
+        reasm_elf_log(" host_pc="); reasm_elf_log_hex((unsigned)pc);
+        reasm_elf_log(" guest_hint="); reasm_elf_log_hex(g_canvas_watch_guest_ip);
+        reasm_elf_log(" (runtime _cpu non espone _eip)\\n");
+        (void)sigaction(sig,&g_canvas_watch_old_action,0);
+        return;
+    }
+    if (g_canvas_watch_old_action.sa_handler &&
+        g_canvas_watch_old_action.sa_handler!=SIG_DFL &&
+        g_canvas_watch_old_action.sa_handler!=SIG_IGN) {
+        g_canvas_watch_old_action.sa_handler(sig);
+    } else {
+        _exit(128+sig);
+    }
+}
+
+void host_elf_canvas_watch_arm(unsigned int guest_hint) {
+    struct sigaction action;
+    unsigned long lo,hi;
+    const char *enabled=getenv("SC_CANVAS_WATCH");
+    if (!enabled || enabled[0]!='1' || !g_canvas_is_mmap || !g_canvas || g_canvas_watch_fired || g_canvas_watch_armed) return;
+    lo=(unsigned long)g_canvas+86ul*(unsigned int)g_pitch;
+    hi=(unsigned long)g_canvas+394ul*(unsigned int)g_pitch;
+    g_canvas_watch_lo=lo&~4095ul;
+    g_canvas_watch_hi=(hi+4095ul)&~4095ul;
+    g_canvas_watch_guest_ip=guest_hint;
+    if (sigaction(SIGSEGV,0,&g_canvas_watch_old_action)!=0) return;
+    memset(&action,0,sizeof action);
+    action.sa_sigaction=canvas_watch_sigsegv;
+    action.sa_flags=SA_SIGINFO;
+    (void)sigemptyset(&action.sa_mask);
+    if (sigaction(SIGSEGV,&action,0)!=0) return;
+    if (mprotect((void *)g_canvas_watch_lo,g_canvas_watch_hi-g_canvas_watch_lo,1 /* PROT_READ */)!=0) {
+        (void)sigaction(SIGSEGV,&g_canvas_watch_old_action,0);
+        return;
+    }
+    g_canvas_watch_armed=1;
+}
+#endif
+
 static int canvas_alloc(int w, int h) {
     int pitch = (w + 3) & ~3;                 /* righe allineate a 4: pitch puo' essere > w */
     unsigned long size;
     if (w <= 0 || h <= 0) return -1;
     size = (unsigned long) pitch * (unsigned long) h;
-    if (g_canvas) { free(g_canvas); g_canvas = 0; }
+#if defined(__arm__)
+    if (g_canvas) {
+        if (g_canvas_is_mmap) (void)munmap(g_canvas,g_canvas_map_size); else free(g_canvas);
+        g_canvas = 0; g_canvas_is_mmap = 0; g_canvas_map_size = 0;
+    }
+    g_canvas_watch_armed=0; g_canvas_watch_fired=0;
+    if (getenv("SC_CANVAS_WATCH") && getenv("SC_CANVAS_WATCH")[0]=='1') {
+        g_canvas_map_size=(size+4095ul)&~4095ul;
+        g_canvas=(unsigned char *)mmap(0,g_canvas_map_size,3,0x22,-1,0);
+        if (g_canvas==(unsigned char *)-1) g_canvas=0;
+        else g_canvas_is_mmap=1;
+    } else
+#endif
+    {
+        if (g_canvas) { free(g_canvas); g_canvas = 0; }
+        g_canvas = (unsigned char *) malloc(size);
+    }
     if (g_present_snapshot) { free(g_present_snapshot); g_present_snapshot = 0; }
     g_present_snapshot_size = size; g_present_snapshot_valid = 0; g_present_force = 1;
-    g_canvas = (unsigned char *) malloc(size);
-    if (!g_canvas) { g_err = "malloc canvas"; return -1; }
+    if (!g_canvas) { g_err = "canvas allocation"; return -1; }
     memset(g_canvas, 0, size);
     g_w = w; g_h = h; g_pitch = pitch;
     g_locked = 0;
+    reasm_elf_log("[canvas] alloc "); reasm_elf_log_hex((unsigned) (unsigned long) g_canvas);
+    reasm_elf_log(" size="); reasm_elf_log_hex((unsigned) size);
+    reasm_elf_log(" whp="); reasm_elf_log_hex((unsigned) w); reasm_elf_log_hex((unsigned) h);
+    reasm_elf_log_hex((unsigned) pitch); reasm_elf_log("\n");
     return 0;
 }
 
@@ -463,7 +550,15 @@ int host_elf_display_mode(int w, int h, int bpp) {
 void host_elf_shutdown(void) {
     host_elf_audio_close();
     if (g_gl_context) { SDL_GL_DeleteContext(g_gl_context); g_gl_context = 0; }
-    if (g_canvas) { free(g_canvas); g_canvas = 0; }
+    if (g_canvas) {
+#if defined(__arm__)
+        if (g_canvas_is_mmap) (void)munmap(g_canvas,g_canvas_map_size); else free(g_canvas);
+        g_canvas_is_mmap=0; g_canvas_map_size=0;
+#else
+        free(g_canvas);
+#endif
+        g_canvas = 0;
+    }
     g_locked = 0; g_w = g_h = g_pitch = 0;
     if (g_win) { SDL_DestroyWindow(g_win); g_win = 0; }
     g_map_valid = 0; g_map_fmt = 0;
@@ -1129,6 +1224,35 @@ void host_elf_present(void) {
     SDL_Surface *ws;
     unsigned int now, cap;
     if (!g_win || !g_canvas) return;
+    /* Diagnostica del "video nero": il canvas contiene il frame al momento del blit (misurato dal
+     * lato SCode) ma qui puo' arrivare azzerato o con una palette nera. SC_PRESENT_DBG=1 stampa
+     * indici non-zero, indice massimo e voci di palette non nere ogni 30 present. */
+    {   static int dbg = -1;
+        static unsigned int tick;
+        if (dbg < 0) { const char *v = getenv("SC_PRESENT_DBG"); dbg = (v && v[0] == '1'); }
+        if (dbg && (tick++ % 30u) == 0u) {
+            unsigned int i, x, y, nz = 0, nz_film = 0, maxi = 0, pal_nz = 0;
+            for (i = 0; i < (unsigned int) g_w * (unsigned int) g_h; i += 7u) {
+                unsigned char c = g_canvas[i];
+                if (c) { ++nz; if (c > maxi) maxi = c; }
+            }
+            for (y = 86u; y < 394u && y < (unsigned int) g_h; ++y)
+                for (x = 0; x < (unsigned int) g_w; ++x)
+                    if (g_canvas[(unsigned long)y * (unsigned int)g_pitch + x]) ++nz_film;
+            for (i = 0; i < 256u; ++i) if (g_pal[i] & 0x00FFFFFFu) ++pal_nz;
+            reasm_elf_log("[present-dbg] nz_idx="); reasm_elf_log_hex(nz);
+            reasm_elf_log(" max_idx="); reasm_elf_log_hex(maxi);
+            reasm_elf_log(" nz_film_86_393="); reasm_elf_log_hex(nz_film);
+            reasm_elf_log(" canvas_write_ticks="); reasm_elf_log_hex(__sync_fetch_and_add(&g_canvas_write_ticks, 0u));
+            reasm_elf_log(" canvas="); reasm_elf_log_hex((unsigned) (unsigned long) g_canvas);
+            reasm_elf_log(" whp="); reasm_elf_log_hex((unsigned) g_w);
+            reasm_elf_log_hex((unsigned) g_h); reasm_elf_log_hex((unsigned) g_pitch);
+            reasm_elf_log(" pal_nonblack="); reasm_elf_log_hex(pal_nz);
+            reasm_elf_log(" first16=");
+            for (i = 0; i < 16u; ++i) reasm_elf_log_hex(g_pal[i]);
+            reasm_elf_log("\n");
+        }
+    }
     /* Il server non legge mai il canvas: la richiesta viene copiata qui, nel thread proprietario. */
     sc_ctl_present(g_canvas, g_w, g_h, g_pitch, g_pal);
     /* Input/pump resta sempre non-throttled anche quando si deduplica o si limita il present. */

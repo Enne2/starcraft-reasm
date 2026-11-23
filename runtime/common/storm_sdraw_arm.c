@@ -172,12 +172,29 @@ static uint32_t args_and_relocate_return(_cpu *cpu, unsigned n, uint32_t *args) 
     return ret;
 }
 
+static int scode_trace_on(void);
+
 void storm_313_arm_body(_cpu *cpu) {
     uint32_t a[8], dst, src, width, rows, dst_pitch, src_pitch, pattern, rop;
-    uint32_t row, col;
-    (void)args_and_relocate_return(cpu,8,a);
+    uint32_t row, col, guest_ret;
+    guest_ret=args_and_relocate_return(cpu,8,a);
     dst=a[0]; src=a[1]; width=a[2]; rows=a[3];
     dst_pitch=a[4]; src_pitch=a[5]; pattern=a[6]; rop=a[7];
+    if (scode_trace_on()) {
+        extern unsigned char *host_elf_canvas(int *,int *,int *);
+        int cw=0,ch=0,cp=0;
+        unsigned char *canvas=host_elf_canvas(&cw,&ch,&cp);
+        uint64_t cb=(uint32_t)(unsigned long)canvas;
+        if (canvas && dst>=cb && dst<cb+(uint64_t)(unsigned int)cp*(unsigned int)ch) {
+            static unsigned int n;
+            if (n++<32u) {
+                log_s("[storm-313-canvas] ret/dst/src="); log_hex(guest_ret); log_hex(dst); log_hex(src);
+                log_s(" width/rows/dst_pitch/src_pitch="); log_hex(width); log_hex(rows);
+                log_hex(dst_pitch); log_hex(src_pitch);
+                log_s(" pattern/rop="); log_hex(pattern); log_hex(rop);
+            }
+        }
+    }
     if ((int32_t)width<=0 || (int32_t)rows<=0) { cpu->_eax=1; return; }
     if (rop!=0x00CC0020u && rop!=0x00F00021u) fail73("ROP",rop,0);
     {
@@ -565,6 +582,7 @@ static void run_2x_lut(_cpu *cpu,uint32_t entry,uint32_t a2,uint32_t rows,uint32
 void storm_334_arm_body(_cpu *cpu) {
     uint32_t a[2],p,code1,code2,code3,size1,size2,size3,width,rows,dst,src,dst_delta,src_delta,base,flags,ret;
     uint32_t descriptor_flags,stub;
+    int writes_canvas=0,ticked=0;
     ScSpan src_span={0,0,0},dst_span={0,0,0},base_span={0,0,0};
     ret=args_and_relocate_return(cpu,2,a); (void)ret;
     p=a[1];
@@ -574,6 +592,23 @@ void storm_334_arm_body(_cpu *cpu) {
     code1=rd32(a[0]+20); size1=rd32(a[0]+24); code3=rd32(a[0]+44); size3=rd32(a[0]+48);
     code2=rd32(a[0]+68); size2=rd32(a[0]+72);
     if (!width || !rows) { cpu->_eax=1; return; }
+    /* Sequenza delle scritture sul canvas: serve a capire chi azzera il frame del filmato
+     * introduttivo (su ARM il canvas ha contenuto subito dopo il blit 2x e zero al present). */
+    if (scode_trace_on()) {
+        extern unsigned char *host_elf_canvas(int *, int *, int *) __attribute__((weak));
+        int cw=0,ch=0,cp=0; unsigned char *canv=host_elf_canvas?host_elf_canvas(&cw,&ch,&cp):0;
+        uint32_t cb=(uint32_t)(unsigned long)canv;
+        if (canv && cb && dst>=cb && dst<cb+(uint32_t)cp*(uint32_t)ch) {
+            static uint32_t seq;
+            if (seq++ < 48u) {
+                log_s("[canvas-write] seq="); log_hex(seq);
+                log_s(" off="); log_hex(dst-cb);
+                log_s(" w/r/dd/sd="); log_hex(width); log_hex(rows); log_hex(dst_delta); log_hex(src_delta);
+                log_s(" entry="); log_hex(a[0]);
+                log_s((width>=640u && rows>=480u && dst==cb)?" FULL-fill\n":"\n");
+            }
+        }
+    }
     if (flags!=0x40u) fail73("storm_334 flags",0,flags);
     if (!size1 || !size2 || !proc_range(code1,size1,1) || !proc_range(code2,size2,1)) {
         log_s("[storm-scode] code1/size1="); log_hex(code1); log_hex(size1);
@@ -586,6 +621,15 @@ void storm_334_arm_body(_cpu *cpu) {
                        (descriptor_flags&0x04000000u)!=0,1,&dst_span) ||
         !validate_rows(src,rows,width,src_delta,rd32(p+52),
                        (descriptor_flags&0x04000000u)!=0,0,&src_span)) fail73("surface range",0,flags);
+    {
+        extern unsigned char *host_elf_canvas(int *, int *, int *);
+        extern volatile unsigned int g_canvas_write_ticks;
+        int cw=0,ch=0,cp=0;
+        unsigned char *canvas=host_elf_canvas(&cw,&ch,&cp);
+        uint64_t canvas_lo=(uint32_t)(unsigned long)canvas;
+        uint64_t canvas_hi=canvas_lo+(uint64_t)(unsigned int)cp*(unsigned int)ch;
+        writes_canvas=canvas && dst_span.valid && dst_span.lo<canvas_hi && dst_span.hi>canvas_lo;
+    }
     base=rd32(p+32);
     if (base && proc_range(base,65536u,0)) {
         base_span.lo=base; base_span.hi=base+65536u; base_span.valid=(base_span.hi>base);
@@ -680,23 +724,35 @@ void storm_334_arm_body(_cpu *cpu) {
           if (!range_2d(dst,rows,640u,dst_delta,1) || !range_2d(src,rows,320u,src_delta,0))
               fail73("2x LUT surface span",0,flags);
           run_2x_lut(cpu,entry,p,rows,dst_delta,src_delta);
+          if (writes_canvas) {
+              extern volatile unsigned int g_canvas_write_ticks;
+              __sync_add_and_fetch(&g_canvas_write_ticks,1u);
+              ticked=1;
+          }
           if (scode_trace_on()) {
-              static int video_surface_reported;
-              if (!video_surface_reported) {
-                  uint8_t *canvas; int cw=0,ch=0,cp=0; uint32_t nz_src=0,nz_dst=0,nz_canvas=0,y,x;
-                  extern unsigned char *host_elf_canvas(int *,int *,int *);
-                  for(y=0;y<rows;y++) for(x=0;x<320u;x++) nz_src+=((uint8_t *)(unsigned long)src)[(int64_t)y*(320+(int32_t)src_delta)+x]!=0;
-                  if (nz_src) {
-                      canvas=host_elf_canvas(&cw,&ch,&cp);
-                      for(y=0;y<rows;y++) for(x=0;x<640u;x++) nz_dst+=((uint8_t *)(unsigned long)dst)[(int64_t)y*(640+(int32_t)dst_delta)+x]!=0;
-                      if (canvas && cw>=640 && ch>=480 && cp>=640)
-                          for(y=0;y<480u;y++) for(x=0;x<640u;x++) nz_canvas+=canvas[(unsigned long)y*cp+x]!=0;
-                      log_s("[storm-scode-video] src/dst/canvas="); log_hex(src); log_hex(dst);
-                      log_hex((uint32_t)(unsigned long)canvas); log_s(" rows/delta="); log_hex(rows); log_hex(dst_delta);
-                      log_s(" nonzero src/dst/canvas="); log_hex(nz_src); log_hex(nz_dst); log_hex(nz_canvas); log_s("\\n");
-                      video_surface_reported=1;
-                  }
+              static unsigned int video_seq;
+              uint8_t *canvas; int cw=0,ch=0,cp=0;
+              uint32_t nz_src=0,nz_dst=0,nz_canvas=0,y,x;
+              extern unsigned char *host_elf_canvas(int *,int *,int *);
+              extern void host_elf_canvas_watch_arm(unsigned int) __attribute__((weak));
+              extern volatile unsigned int g_canvas_write_ticks;
+              for(y=0;y<rows;y++) for(x=0;x<320u;x++)
+                  nz_src+=((uint8_t *)(unsigned long)src)[(int64_t)y*(320+(int32_t)src_delta)+x]!=0;
+              canvas=host_elf_canvas(&cw,&ch,&cp);
+              for(y=0;y<rows;y++) for(x=0;x<640u;x++)
+                  nz_dst+=((uint8_t *)(unsigned long)dst)[(int64_t)y*(640+(int32_t)dst_delta)+x]!=0;
+              if (canvas && cw>=640 && ch>=394 && cp>=640)
+                  for(y=86u;y<394u;y++) for(x=0;x<640u;x++)
+                      nz_canvas+=canvas[(unsigned long)y*cp+x]!=0;
+              if (video_seq++ < 48u) {
+                  log_s("[storm-scode-video] seq/tick="); log_hex(video_seq);
+                  log_hex(__sync_fetch_and_add(&g_canvas_write_ticks,0u));
+                  log_s(" src/dst/canvas="); log_hex(src); log_hex(dst);
+                  log_hex((uint32_t)(unsigned long)canvas);
+                  log_s(" nonzero src/dst/filmrect=");
+                  log_hex(nz_src); log_hex(nz_dst); log_hex(nz_canvas);
               }
+              if (nz_dst && host_elf_canvas_watch_arm) host_elf_canvas_watch_arm(entry);
           }
       } else {
           static int fallback_announced;
@@ -709,5 +765,9 @@ void storm_334_arm_body(_cpu *cpu) {
                     &src_span,&dst_span,&base_span);
       }
       }
+    }
+    if (writes_canvas && !ticked) {
+        extern volatile unsigned int g_canvas_write_ticks;
+        __sync_add_and_fetch(&g_canvas_write_ticks,1u);
     }
 }
