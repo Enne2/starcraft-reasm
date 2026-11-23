@@ -158,6 +158,38 @@ typedef struct { unsigned int type; unsigned char pad[60]; } SDL_EventBuf;
 /* ---- stato globale del host ---- */
 static void *g_win;
 static unsigned char *g_canvas;
+const char *g_present_reason = "?";   /* chi ha chiesto il present (diagnostica) */
+void host_elf_present_reason(const char *r) { g_present_reason = r ? r : "?"; }
+/* Chiamato dai percorsi DDraw/GDI: presenta al massimo ogni SC_PRESENT_MIN_MS (default 12 ms) e
+ * NON attende mai il pacing. Un `Blt` non deve bloccare il thread di gioco: con l'attesa il
+ * thread che riempie i buffer audio restava indietro e il suono andava in loop. */
+void host_elf_present(void);
+static int g_present_nowait;
+int host_elf_present_coalesced(void) {
+    static unsigned int last;
+    /* Solo il thread che possiede la finestra/contesto puo' presentare. */
+    static unsigned int min_ms = 0xFFFFFFFFu;
+    unsigned int now;
+    if (min_ms == 0xFFFFFFFFu) {
+        const char *v = getenv("SC_PRESENT_MIN_MS");
+        long lv = (v && *v) ? atol(v) : 12;
+        if (lv < 0) lv = 0; if (lv > 200) lv = 200;
+        min_ms = (unsigned int) lv;
+    }
+    if (!host_elf_input_owner()) return 0;
+    now = SDL_GetTicks();
+    if (last && now - last < min_ms) return 0;
+    last = now;
+    g_present_nowait = 1;
+    host_elf_present();
+    g_present_nowait = 0;
+    return 1;
+}
+void host_elf_present_now(void) {
+    g_present_nowait = 1;
+    host_elf_present();
+    g_present_nowait = 0;
+}
 static int g_w, g_h, g_pitch, g_bpp;
 volatile unsigned int g_canvas_write_ticks;
 #if defined(__arm__)
@@ -1230,17 +1262,27 @@ void host_elf_present(void) {
     {   static int dbg = -1;
         static unsigned int tick;
         if (dbg < 0) { const char *v = getenv("SC_PRESENT_DBG"); dbg = (v && v[0] == '1'); }
-        if (dbg && (tick++ % 30u) == 0u) {
-            unsigned int i, x, y, nz = 0, nz_film = 0, maxi = 0, pal_nz = 0;
+        if (dbg) { ++tick;
+            unsigned int i, x, y, nz = 0, nz_film = 0, maxi = 0, pal_nz = 0, hsh = 2166136261u;
             for (i = 0; i < (unsigned int) g_w * (unsigned int) g_h; i += 7u) {
                 unsigned char c = g_canvas[i];
                 if (c) { ++nz; if (c > maxi) maxi = c; }
+                hsh = (hsh ^ c) * 16777619u;
             }
             for (y = 86u; y < 394u && y < (unsigned int) g_h; ++y)
                 for (x = 0; x < (unsigned int) g_w; ++x)
                     if (g_canvas[(unsigned long)y * (unsigned int)g_pitch + x]) ++nz_film;
             for (i = 0; i < 256u; ++i) if (g_pal[i] & 0x00FFFFFFu) ++pal_nz;
-            reasm_elf_log("[present-dbg] nz_idx="); reasm_elf_log_hex(nz);
+            if (!nz || (tick % 10u) == 0u) {
+            reasm_elf_log(nz ? "[present-seq] tick=" : "[present-black] tick="); reasm_elf_log_hex(tick);
+            reasm_elf_log(" nz="); reasm_elf_log_hex(nz);
+            reasm_elf_log(" why="); reasm_elf_log(g_present_reason);
+            reasm_elf_log(" h="); reasm_elf_log_hex(hsh >> 8);
+            reasm_elf_log("\n");
+            }
+            if (0) {
+            reasm_elf_log("[present-dbg] tid="); reasm_elf_log_hex((unsigned)(pthread_self() & 0xFFFFu));
+            reasm_elf_log(" nz_idx="); reasm_elf_log_hex(nz);
             reasm_elf_log(" max_idx="); reasm_elf_log_hex(maxi);
             reasm_elf_log(" nz_film_86_393="); reasm_elf_log_hex(nz_film);
             reasm_elf_log(" canvas_write_ticks="); reasm_elf_log_hex(__sync_fetch_and_add(&g_canvas_write_ticks, 0u));
@@ -1251,6 +1293,7 @@ void host_elf_present(void) {
             reasm_elf_log(" first16=");
             for (i = 0; i < 16u; ++i) reasm_elf_log_hex(g_pal[i]);
             reasm_elf_log("\n");
+            }
         }
     }
     /* Il server non legge mai il canvas: la richiesta viene copiata qui, nel thread proprietario. */
@@ -1267,6 +1310,7 @@ void host_elf_present(void) {
          * SC_FPS_SLEEP=0 disabilita il pacing (comportamento busy-wait precedente). */
         static int sleep_en;
         static int sleep_init;
+        if (g_present_nowait) return;          /* niente attesa: il frame lo decide il gioco */
         if (!sleep_init) { const char *sv = getenv("SC_FPS_SLEEP"); sleep_en = !(sv && sv[0] == '0'); sleep_init = 1; }
         if (sleep_en) {
             static unsigned int max_sleep;

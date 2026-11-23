@@ -1126,6 +1126,13 @@ S int PeekMessageA(void *msg, unsigned int hwnd, unsigned int mn, unsigned int m
     int i;
     if(!msg) return 0;
     win32_input_pump();
+    /* Tick di presentazione a cadenza limitata: alcune schermate (es. selezione campagna) sono
+     * disegnate SOLO dal blitter SCode di storm, senza alcun Blt/Flip DirectDraw: senza questo
+     * tick il canvas cambia ma la finestra resta ferma su un frame vecchio (figure mancanti finche'
+     * un ridisegno qualunque forza un present). Vedi docs/REPORT: bug "Terran/Zerg neri". */
+    {   extern int host_elf_present_coalesced(void) __attribute__((weak));
+        if (host_elf_present_coalesced) (void) host_elf_present_coalesced();
+    }
     for(i=g_qh;i!=g_qt;i=(i+1)%MAX_Q) {
         if(g_q[i].hwnd==g_game_hwnd && g_game_hwnd && g_q[i].message==0xF && *(volatile unsigned int *)0x6CF4A8u) continue;
         QMsg *q=&g_q[i];

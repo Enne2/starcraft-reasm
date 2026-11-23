@@ -4,6 +4,7 @@
  * windows/children are composed on it; HWNDs remain in win32_ui's registry.
  */
 #include "dlg_elf.h"
+extern int host_elf_present_coalesced(void);
 #include "host_elf.h"
 #include "gdi_elf.h"
 #include "reasm_elf.h"
@@ -537,7 +538,7 @@ int dlg_elf_template(void *inst,const void *data,unsigned int size,unsigned int 
       if(havepal && host_elf_set_palette) host_elf_set_palette(savedpal,0,256);
       if(savedpixels && host_elf_canvas) {
           int w,h,p; unsigned char *px=host_elf_canvas(&w,&h,&p);
-          if(px && w==savedw && h==savedh && p==savedpitch) { memcpy(px,savedpixels,(unsigned long)p*h); host_elf_present(); }
+          if(px && w==savedw && h==savedh && p==savedpitch) { memcpy(px,savedpixels,(unsigned long)p*h); (void) host_elf_present_coalesced(); }
       }
       free(savedpixels);
       if(host_elf_set_title && owner && IsWindow(owner)) { char title[TEXT]; GetWindowTextA(owner,title,sizeof title); host_elf_set_title(title); }

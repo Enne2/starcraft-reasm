@@ -602,6 +602,8 @@ void storm_334_arm_body(_cpu *cpu) {
             static uint32_t seq;
             if (seq++ < 48u) {
                 log_s("[canvas-write] seq="); log_hex(seq);
+                log_s(" x="); log_hex((dst-cb) % (uint32_t)cp);
+                log_s(" y="); log_hex((dst-cb) / (uint32_t)cp);
                 log_s(" off="); log_hex(dst-cb);
                 log_s(" w/r/dd/sd="); log_hex(width); log_hex(rows); log_hex(dst_delta); log_hex(src_delta);
                 log_s(" entry="); log_hex(a[0]);
@@ -614,6 +616,26 @@ void storm_334_arm_body(_cpu *cpu) {
         log_s("[storm-scode] code1/size1="); log_hex(code1); log_hex(size1);
         log_s("[storm-scode] code2/size2="); log_hex(code2); log_hex(size2);
         fail73("SCode buffers",0,flags);
+    }
+    /* Traccia compatta di OGNI chiamata SCode (gated REASM_TRACE): serve a vedere quali rettangoli
+     * il guest disegna davvero, indipendentemente dal kernel scelto. */
+    if (scode_trace_on()) {
+        static int sd_n;
+        extern unsigned char *host_elf_canvas(int *, int *, int *) __attribute__((weak));
+        int cw=0,ch=0,cp=0; unsigned char *canv = host_elf_canvas ? host_elf_canvas(&cw,&ch,&cp) : 0;
+        uint32_t cb=(uint32_t)(unsigned long)canv;
+        if (sd_n++ < 400) {
+            log_s("[sd-trace] dst="); log_hex(dst);
+            if (canv && cb && dst >= cb && dst < cb + (uint32_t)cp*(uint32_t)ch) {
+                log_s(" x="); log_hex((dst-cb) % (uint32_t)cp);
+                log_s(" y="); log_hex((dst-cb) / (uint32_t)cp);
+            } else { log_s(" x=fuori y=fuori"); }
+            log_s(" w="); log_hex(width); log_s(" r="); log_hex(rows);
+            log_s(" dw="); log_hex(dst_delta); log_s(" sw="); log_hex(src_delta);
+            log_s(" src="); log_hex(src); log_s(" entry="); log_hex(a[0]);
+            log_s(" dflags="); log_hex(rd32(a[0]+8));
+            log_s((width>=640u && rows>=480u && dst==cb) ? " FULL\n" : "\n");
+        }
     }
     descriptor_flags=rd32(a[0]+8);
     stub=(descriptor_flags&0x04000000u)?0x15030D50u:0x15030D30u;

@@ -143,10 +143,48 @@ static void surf_desc_fill(void *desc, Surf *s) {
                                         : DDSCAPS_OFFSCREENPLAIN);
 }
 
-static void present(Surf *s) {
-    if (!s) return;
-    if (s->is_primary || s->is_back) host_elf_present();
+/* Video memory a pagina singola: nel gioco originale primaria e back buffer sono la STESSA
+ * memoria video, alternata dal Flip. Qui la primaria e' il canvas del host: se il back buffer
+ * fosse un malloc separato, qualunque Flip copierebbe memoria mai disegnata (nera) sopra il
+ * canvas: il filmato introduttivo lampeggia (frame neri intercalati) e le superfici disegnate
+ * per via diretta sul canvas spariscono. Il back buffer viene quindi ALIASATO sul canvas. */
+/* Presentazione: `Blt` muta pixel in una superficie, `Flip` sceglie cosa e' visibile.
+ * Chiamare il present host dopo OGNI Blt promuove a frame visibili stati intermedi (clear,
+ * riempimenti di lavoro) e, con l'attesa di pacing dentro il present, affama il thread che
+ * riempie i buffer audio (loop di un pezzo vecchio). Qui:
+ *  - la superficie di back buffer non presenta nulla: e' memoria nascosta, si marca e basta;
+ *  - la primaria marca un present COALESCED (a cadenza, senza mai bloccare il chiamante);
+ *  - il Flip e' il confine di frame esplicito e forza un present. */
+static int g_back_dirty;
+extern char *getenv(const char *);
+static int ddraw_trace(void) { static int on = -1; if (on < 0) { const char *v = getenv("SC_DDRAW_TRACE"); on = (v && v[0] == '1'); } return on; }
+static void trace_blit(const char *call, Surf *d, Surf *s, const int *dst, const int *src, u32 flags) {
+    if (!ddraw_trace()) return;
+    reasm_elf_log("[ddraw-trace] "); reasm_elf_log(call);
+    reasm_elf_log(" dst="); reasm_elf_log_hex((u32)(unsigned long)(d ? d->px : 0));
+    reasm_elf_log(" src="); reasm_elf_log_hex((u32)(unsigned long)(s ? s->px : 0));
+    reasm_elf_log(" flags="); reasm_elf_log_hex(flags);
+    reasm_elf_log(" drect="); reasm_elf_log_hex((u32)(dst ? dst[0] : 0)); reasm_elf_log(",");
+    reasm_elf_log_hex((u32)(dst ? dst[1] : 0)); reasm_elf_log(",");
+    reasm_elf_log_hex((u32)(dst ? dst[2] - dst[0] : 0)); reasm_elf_log("x");
+    reasm_elf_log_hex((u32)(dst ? dst[3] - dst[1] : 0));
+    reasm_elf_log(" srect="); reasm_elf_log_hex((u32)(src ? src[0] : 0)); reasm_elf_log(",");
+    reasm_elf_log_hex((u32)(src ? src[1] : 0)); reasm_elf_log(",");
+    reasm_elf_log_hex((u32)(src ? src[2] - src[0] : 0)); reasm_elf_log("x");
+    reasm_elf_log_hex((u32)(src ? src[3] - src[1] : 0)); reasm_elf_log("\n");
 }
+
+extern void host_elf_present_reason(const char *);
+extern int host_elf_present_coalesced(void);
+extern void host_elf_present_now(void);
+static void present_tag(Surf *s, const char *why) {
+    if (!s) return;
+    if (s->is_back) { g_back_dirty = 1; return; }          /* memoria nascosta: nessun present */
+    if (!s->is_primary) return;
+    host_elf_present_reason(why);
+    host_elf_present_coalesced();
+}
+static void present(Surf *s) { present_tag(s, "blt"); }
 
 /* La primaria vive nel canvas del host: se il display mode e' cambiato il buffer si e' spostato. */
 static void sync_primary(void) {
@@ -160,6 +198,7 @@ static void sync_primary(void) {
     g_last_dd->primary->h = ch;
     g_last_dd->primary->pitch = cp;
     g_last_dd->primary->size = (unsigned long) cp * (unsigned long) ch;
+
 }
 
 /* Evaluate the Win32 ROP3 truth table (truth index: P,S,D), independently
@@ -279,6 +318,7 @@ S long s_Blt(void *t, void *dst, void *src, void *srcr, u32 flags, void *fx) {
     Surf *d = (Surf *) t, *s = (Surf *) src;
     int dx = 0, dy = 0, dw = -1, dh = -1;
     if (d && d->is_primary) sync_primary();
+    trace_blit("Blt", d, s, (const int *) dst, (const int *) srcr, flags);
     if (dst) { const int *r = (const int *) dst; dx = r[0]; dy = r[1]; dw = r[2] - r[0]; dh = r[3] - r[1]; }
     if ((flags & DDBLT_ROP) && fx && d) {
         u32 rop = *(const u32 *) ((const u8 *) fx + DDBLTFX_DWROP_OFF);
@@ -300,7 +340,7 @@ S long s_Blt(void *t, void *dst, void *src, void *srcr, u32 flags, void *fx) {
             r[0] = dx; r[1] = dy; r[2] = dx + dw; r[3] = dy + dh;
             /* il colore di riempimento di una superficie a palette e' l'INDICE di palette */
             host_elf_fill8(d->px, d->pitch, d->w, d->h, r, (int) (c & 0xFF));
-            present(d);
+            present_tag(d, "fill");
         }
         return DD_OK;
     }
@@ -316,7 +356,7 @@ S long s_Blt(void *t, void *dst, void *src, void *srcr, u32 flags, void *fx) {
         else { cr[0] = dx; cr[1] = dy; cr[2] = dx + dw; cr[3] = dy + dh; }
         blit_clipped(d, s, cr, (const int *) srcr, ckey);
     }
-    present(d);
+    present_tag(d, s == d ? "self" : "blt");
     return DD_OK;
 }
 S long s_BltBatch(void *t, void *b, u32 c, u32 f) { (void) t; (void) b; (void) c; (void) f; return DD_OK; }
@@ -324,6 +364,7 @@ S long s_BltFast(void *t, u32 x, u32 y, void *src, void *srcr, u32 f) {
     Surf *d = (Surf *) t, *s = (Surf *) src;
     int cr[4], ckey;
     if (d && d->is_primary) sync_primary();
+    trace_blit("BltFast", d, s, 0, (const int *) srcr, f);
     if (!s || !s->px || !d || !d->px) return DD_OK;
     ckey = ((f & DDBLTFAST_SRCCOLORKEY) && s->has_ckey) ? (int) (s->ckey & 0xFF) : -1;
     {   const int *sr = (const int *) srcr;
@@ -342,9 +383,13 @@ S long s_Flip(void *t, void *dest, u32 flags) {
     Surf *s = (Surf *) t;
     DD *dd = s->dd;
     (void) dest; (void) flags;
-    if (dd && dd->back && dd->primary && dd->primary->size <= dd->back->size)
-        memcpy(dd->primary->px, dd->back->px, dd->primary->size);
-    present(dd && dd->back ? dd->back : s);
+    if (dd && dd->back && dd->primary && g_back_dirty && dd->primary->px != dd->back->px) {
+        unsigned long n = dd->primary->size <= dd->back->size ? dd->primary->size : dd->back->size;
+        memcpy(dd->primary->px, dd->back->px, n);
+    }
+    g_back_dirty = 0;
+    host_elf_present_reason("flip");
+    host_elf_present_now();          /* confine di frame esplicito: present immediato */
     return DD_OK;
 }
 S long s_GetAttachedSurface(void *t, void *caps, void **out) {
@@ -653,7 +698,8 @@ S long d_CreateSurface(void *t, void *desc, void **out, void *outer) {
                 b->size = (unsigned long) b->pitch * (unsigned long) h;
                 b->px = (u8 *) malloc(b->size ? b->size : 1);
                 if (b->px) { memset(b->px, 0, b->size); b->owns_px = 1; b->is_back = 1; dd->back = b; }
-                else { free(b); }
+                else { free(b); b = 0; }
+                (void) 0;
             }
         }
         s->attached = dd->back;

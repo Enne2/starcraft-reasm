@@ -601,7 +601,8 @@ static void fill_rect_raw(GDC *dc, u8 *px, int w, int h, int pitch, int bpp,
 }
 
 /* ============================ present ============================ */
-static void dc_present(GDC *dc) { if (dc->is_window) host_elf_present(); }
+extern int host_elf_present_coalesced(void);
+static void dc_present(GDC *dc) { if (dc->is_window) (void) host_elf_present_coalesced(); }
 
 /* ============================ palette ============================ */
 static void palette_to_host(GPalette *p) {
