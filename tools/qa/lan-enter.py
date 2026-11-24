@@ -54,10 +54,10 @@ def dialog_open(png):
     """Rileva il dialog del nome: riga bianca centrale su fondo scuro, oppure OCR del titolo."""
     # Euristica robusta e cheap: nel dialog il 25% centrale della schermata e' quasi tutto scuro
     # mentre la cornice superiore contiene la scritta bianca; uso la luminanza di una striscia.
-    out = subprocess.run(["magick", png, "-crop", "300x20+170+152", "+repage", "-colorspace", "Gray",
+    out = subprocess.run(["magick", png, "-crop", "270x16+165+228", "+repage", "-colorspace", "Gray",
                           "-format", "%[fx:mean]", "info:"], capture_output=True, text=True).stdout
     try:
-        return float(out) > 0.10
+        return float(out) > 0.06
     except ValueError:
         return False
 
