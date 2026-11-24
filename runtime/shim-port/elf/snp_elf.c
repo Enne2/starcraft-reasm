@@ -44,6 +44,7 @@ extern int REASM_STDCALL SetEvent(void *) __attribute__((weak));
 #define SNP_CAPS_FLAGS 0x20000002u
 #define SNP_SOL_SOCKET 1
 #define SNP_SO_BROADCAST 6
+#define SNP_SO_RCVBUF 8
 #define SNP_F_GETFL 3
 #define SNP_F_SETFL 4
 #define SNP_O_NONBLOCK 0x800
@@ -899,7 +900,18 @@ static int receive_packet(struct SnpNetAddress **address, char **data, u32 *byte
             have_poll_time = 1;
             if (g_last_poll_valid) {
                 long long elapsed = poll_time_ns - g_last_poll_ns;
-                if (elapsed >= 0 && elapsed < (long long)g_net_poll_ms * 1000000LL) return 0;
+                /* Il throttle esiste per non sprecare syscall sui poll vuoti, ma NON deve
+                 * nascondere un datagramma gia' in coda: con traffico SNet a raffica (decine di
+                 * pacchetti per frame) il ritardo artificiale faceva riempire il buffer del socket
+                 * e perdere pacchetti. Si salta il throttle solo se una PEEK trova dati. */
+                if (elapsed >= 0 && elapsed < (long long)g_net_poll_ms * 1000000LL) {
+                    char probe_byte;
+                    struct SnpSockaddrIn probe_from;
+                    unsigned int probe_len = sizeof probe_from;
+                    int have = recvfrom(g_socket_fd, &probe_byte, 1, SNP_MSG_DONTWAIT | 0x02 /* MSG_PEEK */,
+                                        &probe_from, &probe_len);
+                    if (have <= 0) return 0;
+                }
             }
         }
     }
