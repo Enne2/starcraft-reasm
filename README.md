@@ -1,236 +1,291 @@
-# starcraft-reasm — StarCraft + Storm, port nativo via lifting e shim
+# starcraft-reasm — StarCraft + Storm, a native port via lifting and shims
 
-**Un port nativo di StarCraft e Brood War che non usa Wine, non usa DirectX e non emula una CPU.**
+**A native port of StarCraft and Brood War that uses no Wine, no DirectX and no CPU emulation.**
 
-Il codice del gioco originale non viene eseguito con un emulatore né con un livello di compatibilità:
-viene **tradotto staticamente** in una rappresentazione intermedia (LLVM IR) e poi **ricompilato per
-l'architettura dell'host**. I servizi che il gioco si aspetta dal sistema operativo (Win32, DirectDraw,
-DirectSound, GDI, Smacker, reti SNet/SNP) sono reimplementati da un runtime C che parla direttamente
-con le API native della piattaforma (SDL2, OpenGL/GLES, socket POSIX).
+The original game's code is neither run inside an emulator nor through a compatibility layer: it is
+**statically translated** into an intermediate representation (LLVM IR) and then **recompiled for the
+host architecture**. The services the game expects from the operating system (Win32, DirectDraw,
+DirectSound, GDI, Smacker, SNet/SNP networking) are reimplemented by a C runtime that talks directly
+to the platform's native APIs (SDL2, OpenGL/GLES, POSIX sockets).
 
-Risultato: **StarCraft gira come un programma nativo** su i686 e su ARMv7 (Pinebook Pro), con menu,
-campagne, salvataggi e multiplayer LAN fra due istanze. Nessun asset del gioco è incluso: serve una
-copia personale di StarCraft 1.16.1.
-
----
-
-## Indice
-
-1. [Perché esiste questo progetto](#1-perché-esiste-questo-progetto)
-2. [Come funziona](#2-come-funziona)
-3. [Stato attuale](#3-stato-attuale)
-4. [Requisiti](#4-requisiti)
-5. [Guida: compilare per una piattaforma software/hardware](#5-guida-compilare-per-una-piattaforma-softwarehardware)
-6. [Guida: usare il port](#6-guida-usare-il-port)
-7. [Test e verifica](#7-test-e-verifica)
-8. [Sviluppi futuri](#8-sviluppi-futuri)
-9. [Struttura del repository](#9-struttura-del-repository)
-10. [Licenza, dati di gioco e marchi](#10-licenza-dati-di-gioco-e-marchi)
+The result: **StarCraft runs as a native program** on i686 and on ARMv7 (Pinebook Pro), with menus,
+campaigns, save/load and LAN multiplayer between two instances. No game assets are included: you need
+your own copy of StarCraft 1.16.1.
 
 ---
 
-## 1. Perché esiste questo progetto
+## Contents
 
-Tre motivazioni, in ordine di importanza.
-
-**1. Portare il gioco oltre il suo ecosistema software.** StarCraft 1.16.1 è un binario PE a 32 bit per
-Windows 9x/XP che dipende da DirectDraw, DirectSound, GDI e da Storm.dll: su Linux moderno esiste solo
-attraverso Wine. Wine funziona bene, ma resta un *emulatore di Windows*: paghi il costo di un intero
-sistema operativo simulato (trap, traduzione, sincronizzazione) per eseguire un singolo programma.
-
-**2. Portarlo su altre architetture hardware, non solo altri sistemi operativi.** Un emulatore x86 su
-una scheda ARM o RISC-V paga una traduzione dinamica a ogni esecuzione; un port nativo no. Con il
-lifting il codice del gioco diventa codice dell'architettura di destinazione: su un Pinebook Pro
-(ARMv7) il gioco gira a frame rate pieno con un carico CPU modesto, cosa che un emulatore x86 non
-sarebbe in grado di fare.
-
-**3. Preservazione.** Un binario del 1998 dipende da un'API grafica (DirectDraw) che il sistema
-operativo ha smesso di supportare. Il lifting + shim è un modo per conservare il *comportamento*
-del programma descrivendone le dipendenze in termini che sopravvivono al sistema operativo: il gioco
-resta lo stesso codice, ma le sue dipendenze vivono nel nostro runtime, dove possono essere
-reimplementate, testate e portate.
-
-Da qui la forma del progetto: **una pipeline di lifting** (che produce codice compilabile dal binario
-originale) più **un runtime/shim** (che ne reimplementa i servizi). Nessuna delle due metà, da sola,
-basta: insieme rendono il gioco nativo su qualunque piattaforma per cui esista un compilatore LLVM.
+1. [Why this project exists](#1-why-this-project-exists)
+2. [How it works](#2-how-it-works)
+3. [Current status](#3-current-status)
+4. [Performance](#4-performance)
+5. [Requirements](#5-requirements)
+6. [Guide: building for a software/hardware platform](#6-guide-building-for-a-softwarehardware-platform)
+7. [Guide: using the port](#7-guide-using-the-port)
+8. [Tests and verification](#8-tests-and-verification)
+9. [Future work](#9-future-work)
+10. [Repository layout](#10-repository-layout)
+11. [Licence, game data and trademarks](#11-licence-game-data-and-trademarks)
 
 ---
 
-## 2. Come funziona
+## 1. Why this project exists
+
+Three motivations, in order of importance.
+
+**1. Take the game beyond its software ecosystem.** StarCraft 1.16.1 is a 32-bit PE binary for
+Windows 9x/XP that depends on DirectDraw, DirectSound, GDI and Storm.dll: on modern Linux it only
+exists through Wine. Wine works well, but it remains a *Windows emulator*: you pay the cost of an
+entire simulated operating system (traps, translation, synchronisation) to run a single program.
+
+**2. Take it to other hardware architectures, not just other operating systems.** An x86 emulator on
+an ARM or RISC-V board pays for dynamic translation on every run; a native port does not. With
+lifting, the game's code becomes code of the target architecture: on a Pinebook Pro (ARMv7) the game
+runs at full frame rate with modest CPU load, something an x86 emulator could not achieve.
+
+**3. Preservation.** A 1998 binary depends on a graphics API (DirectDraw) that the operating system
+has stopped supporting. Lifting + shims is a way to preserve the program's *behaviour* by describing
+its dependencies in terms that outlive the operating system: the game remains the same code, but its
+dependencies live in our runtime, where they can be reimplemented, tested and ported.
+
+Hence the shape of the project: **a lifting pipeline** (which turns the original binary into
+compilable code) plus **a runtime/shim** (which reimplements its services). Neither half is enough on
+its own: together they make the game native on any platform for which an LLVM compiler exists.
+
+---
+
+## 2. How it works
 
 ```
-StarCraft.exe / storm.dll            (binari originali: copia personale dell'utente)
+StarCraft.exe / storm.dll            (original binaries: the user's own copy)
         │
         │  1. LIFTING  (vendor/sr: SR/llasm, static recompiler)
         ▼
-StarCraft.llasm / storm.llasm        (rappresentazione intermedia del codice tradotto)
+StarCraft.llasm / storm.llasm        (intermediate representation of the translated code)
         │
-        │  2. TRADUZIONE  (tools/, LLVM)
+        │  2. TRANSLATION  (tools/, LLVM)
         ▼
-StarCraft.ll / storm.ll              (LLVM IR, con dispatch table e ABI guest)
+StarCraft.ll / storm.ll              (LLVM IR, with dispatch table and guest ABI)
         │
-        │  3. COMPILAZIONE  (llc -mtriple=<architettura>)
+        │  3. COMPILATION  (llc -mtriple=<architecture>)
         ▼
-StarCraft.entry.o / storm.entry.o    (codice nativo per l'host)
+StarCraft.entry.o / storm.entry.o    (native code for the host)
         │
-        │  4. LINK  (con il nostro runtime)
+        │  4. LINK  (with our runtime)
         ▼
 build/starcraft-x86  |  build/starcraft-armv7 ...
 ```
 
-Il passaggio chiave è il **3**: lo stesso IR viene compilato per triple diverse. Cambiare architettura
-non significa riscrivere il port, significa cambiare `-mtriple` e fornire lo strato minimo dipendente
-dall'ISA.
+The key step is **3**: the same IR is compiled for different triples. Changing architecture does not
+mean rewriting the port, it means changing `-mtriple` and providing the minimal ISA-dependent layer.
 
-Il **runtime** (`runtime/`) fornisce ciò che il codice tradotto si aspetta:
+The **runtime** (`runtime/`) provides what the translated code expects:
 
-| Livello | Cosa fa |
+| Layer | What it does |
 |---|---|
-| `runtime/common/` | CPU guest (registri, flag, x87), mappatura della memoria virtuale guest, dispatch delle chiamate indirette, bridge verso il codice C, SCode (i blitter di Storm), SComp (decompressore) |
-| `runtime/arch/<arch>/` | solo l'assembly inevitabilmente specifico: trampolino del dispatch indiretto, bridge COM, azzeramento guest, TLS |
-| `runtime/shim-port/elf/` | Win32 (file, processi, sincronizzazione, registro, messaggi), DirectDraw, DirectSound, GDI, Smacker, SNet/SNP (rete), SDL2 + OpenGL per la presentazione |
-| `tools/` | pipeline di build, lifting, generazione dei bridge, QA (`sc_ctl`, sandbox isolata) |
+| `runtime/common/` | guest CPU (registers, flags, x87), guest virtual memory mapping, indirect-call dispatch, bridge to C code, SCode (Storm's blitters), SComp (decompressor) |
+| `runtime/arch/<arch>/` | only the unavoidably architecture-specific assembly: indirect dispatch trampoline, COM bridge, guest zeroing, TLS |
+| `runtime/shim-port/elf/` | Win32 (files, processes, synchronisation, registry, messages), DirectDraw, DirectSound, GDI, Smacker, SNet/SNP (networking), SDL2 + OpenGL for presentation |
+| `tools/` | build pipeline, lifting, bridge generation, QA (`sc_ctl`, isolated sandbox) |
 
-Due regole di progetto che spiegano molte scelte nel codice:
+Two project rules that explain many decisions in the code:
 
-- **l'oracolo è il binario**: ogni costante, layout di struttura, arità `stdcall` o indirizzo nel
-  runtime cita l'indirizzo del decompilato che la giustifica (vedi `reports/ANALYSIS-*.md`);
-- **fail-closed**: una funzione di cui non è provato il contratto restituisce un errore esplicito e
-  logga, invece di restituire valori inventati che sembrerebbero funzionare. Un gioco che si blocca
-  in modo visibile è meglio di un gioco che corrompe stato silenziosamente.
+- **the binary is the oracle**: every constant, struct layout, `stdcall` arity or address in the
+  runtime cites the address in the decompiled binary that justifies it (see `reports/ANALYSIS-*.md`);
+- **fail-closed**: a function whose contract has not been proven returns an explicit error and logs it,
+  instead of returning invented values that would look like they work. A game that visibly gets stuck
+  is better than a game that silently corrupts state.
 
 ---
 
-## 3. Stato attuale
+## 3. Current status
 
-| Area | Stato |
+| Area | Status |
 |---|---|
-| **i686 (Linux, anche host a 64 bit)** | giocabile: menu, campagne (Terran/Zerg/Protoss), salvataggi e caricamento, filmati, audio |
-| **ARMv7 hard-float (Pinebook Pro)** | giocabile: parità con i686 su menu, campagne, save/load, filmato introduttivo |
-| **Multiplayer LAN** | funzionante fra due istanze: discovery UDP, lista partite, join, partita con lockstep attivo |
-| **Battle.net / PvPGN** | **non supportato** (vedi §8.2) |
-| **Architetture 64-bit** | **non supportate**: l'IR attuale ha puntatori a 32 bit (vedi §8.1) |
+| **i686 (Linux, 64-bit host included)** | playable: menus, campaigns (Terran/Zerg/Protoss), save and load, movies, audio |
+| **ARMv7 hard-float (Pinebook Pro)** | playable: parity with i686 on menus, campaigns, save/load, intro movie |
+| **ARMv6 (Raspberry Pi 1 / Pi Zero) — experimental** | the pipeline exists and the binary runs, but it has **not yet been validated on real hardware** (QEMU only, see §9.1) |
+| **LAN multiplayer** | working between two instances: UDP discovery, game list, join, game with lockstep running |
+| **Battle.net / PvPGN** | **not supported** (see §9.3) |
+| **64-bit architectures** | **not supported**: the current IR uses 32-bit pointers (see §9.1) |
 
-Numeri utili: la divergenza di codice fra le due architetture è **1,08%** (224 righe su 20.697,
-elencate in `reports/REPORT-x86-vs-arm.md`); la mappa di dispatch ha **102.392 voci, 0 collisioni**.
+Useful numbers: code divergence between the two architectures is **1.08%** (224 lines out of 20,697,
+listed in `reports/REPORT-x86-vs-arm.md`); the dispatch map has **102,392 entries, 0 collisions**.
 
 ---
 
-## 4. Requisiti
+## 4. Performance
 
-| Cosa | Note |
+Every number below is measured, not estimated; the method and the raw logs are in
+`reports/PERF-WINE-COMPARISON.md`, `reports/PROF-CPU.md`, `reports/PROF-RAM.md`,
+`reports/REPORT-opt-*.md` and `reports/REPORT-graphics-final.md`.
+
+### 4.1 i686: native port vs the same game under Wine
+
+Same machine (16 logical CPUs), CPU and memory sampled from `/proc` at 1 Hz, 5 samples per phase,
+medians:
+
+| Phase | CPU, native (% of one core) | CPU, Wine | RSS game, native | RSS game, Wine | RSS whole tree, native | RSS whole tree, Wine |
+|---|---:|---:|---:|---:|---:|---:|
+| Boot | 84.3 | 116.7 | 140.7 MiB | 206.5 MiB | 144.1 MiB | 437.4 MiB |
+| Menu | 141.2 | 92.8 | 142.3 MiB | 202.9 MiB | 142.3 MiB | 412.4 MiB |
+| Gameplay | 130.1 | 83.4 | 92.7 MiB | 164.5 MiB | 92.7 MiB | 339.1 MiB |
+
+**Read these numbers with the caveat that matters**: the comparison is *not* frame-for-frame. The
+native port is uncapped and rendered **79–610 FPS** in those runs, while the original under Wine keeps
+its DirectDraw loop cap at **~24–30 FPS**. Per frame the native port does 2–6× the rendering work and
+still costs the same or less CPU, so on equal frames it is clearly cheaper. What is structural is the
+memory: Wine pays **+246…+293 MiB of whole-tree RSS** (explorer.exe, 2× winedevice.exe, services.exe,
+wineserver) and **+60…+72 MiB on the game process alone**; the native port is a single ELF32 with no
+extra processes.
+
+### 4.2 What was optimised, and what it bought
+
+| Optimisation | Effect (measured) |
 |---|---|
-| Copia personale di **StarCraft / Brood War 1.16.1** | il repository non contiene asset né binari |
-| `clang`, `ld.lld`, `llc`, `opt`, `llvm-nm` | LLVM 18+ consigliato |
-| Python 3 | per gli strumenti di lifting e generazione |
-| SDL2 | runtime (x11/wayland) |
-| `x86`: multilib a 32 bit (`gcc-multilib` o equivalente) | per compilare gli shim `-m32` |
-| `ARMv7`: sysroot armhf | in `build/sysroot`, oppure passare `SYSROOT=...` |
-| `libsmacker` per la tua architettura | sorgenti in `vendor/libsmacker`, caricata a runtime |
+| **SCode 1×/2× LUT fast paths** (Storm's pixel kernels, `runtime/common/storm_sdraw.c`) | **55.75×** faster than the interpreter on a 100×364×4 workload, with bit-exact parity for widths 1..364 |
+| **Native SComp decompressor** (`storm_scomp.c`, Huffman + ADPCM) | 125.7 MiB/s on PKWARE-compressed sectors, 50.0 MiB/s on Huffman+ADPCM; 4292/4292 sectors byte-exact |
+| **Frame pacing + syscall reduction** (`SC_FPS_CAP`) | from ~108% of one core (uncapped menu) to **~24% at 25 FPS** |
+| **Presentation path** (CPU framebuffer with palette LUT, GPU texture, GL/GLES2 palette shader) | `SC_GL_VERIFY=1` confirms **307,200/307,200 pixels** identical between the GL frame and the CPU canvas |
+| **Guest memory map cache** (`proc_range`) and dispatch cache | removed the per-call `/proc/self/maps` parsing that dominated the ARMv6 profile (~62–68%) |
 
-Per gli asset: copia (o collega) nella directory di gioco gli archivi `.mpq`, i file `.snp`,
-le directory `characters/` e `Save/`, la cartella `maps/`.
+### 4.3 ARMv7 (Pinebook Pro, RK3399 + Mali-T860)
 
----
+| Path | Result |
+|---|---|
+| GL/GLES (Panfrost, GLES 3.1) | menu **170–207 FPS**; in-game **23–24 FPS** at 640×480 with pacing, about **18% of one core** |
+| CPU framebuffer fallback | **64–67 FPS** in menus when the GL path is unavailable (software renderer refused) |
+| Pixel parity GL vs CPU canvas | `SC_GL_VERIFY PASS: 307200 pixel esatti` |
 
-## 5. Guida: compilare per una piattaforma software/hardware
-
-### 5.1 Prima cosa: preparare il lifting
-
-Il lifting si esegue **una volta sola**, sulla macchina dove hai i binari originali, e produce gli
-artefatti (`build/lift-full/StarCraft.ll`, `storm.ll`) che poi si compilano per qualsiasi target.
+### 4.4 How to measure it yourself
 
 ```sh
-# 0) una volta sola: compilare gli strumenti di lifting (SR/llasm + llasm)
+SC_FPS_LOG=1     # per-second frame-rate lines
+SC_PROF=1        # in-process sampling profile
+SC_GL_VERIFY=1   # compare the GL frame against the CPU canvas, pixel by pixel
+SC_FPS_CAP=25    # cap the frame rate (the CPU cost scales down with it)
+```
+`reports/PROF-CPU.md` documents the sampling method (threads, phases, how to read the percentages).
+
+---
+
+## 5. Requirements
+
+| Item | Notes |
+|---|---|
+| Your own copy of **StarCraft / Brood War 1.16.1** | the repository contains neither assets nor binaries |
+| `clang`, `ld.lld`, `llc`, `opt`, `llvm-nm` | LLVM 18+ recommended |
+| Python 3 | for the lifting and generation tools |
+| SDL2 | runtime (x11/wayland) |
+| `x86`: 32-bit multilib (`gcc-multilib` or equivalent) | to compile the `-m32` shims |
+| `ARMv7`: armhf sysroot | in `build/sysroot`, or pass `SYSROOT=...` |
+| `libsmacker` for your architecture | sources in `vendor/libsmacker`, loaded at runtime |
+
+For the assets: copy (or symlink) into the game directory the `.mpq` archives, the `.snp` files, the
+`characters/` and `Save/` directories, and the `maps/` folder.
+
+---
+
+## 6. Guide: building for a software/hardware platform
+
+### 5.1 First of all: run the lifting
+
+Lifting runs **once**, on the machine that holds the original binaries, and produces the artefacts
+(`build/lift-full/StarCraft.ll`, `storm.ll`) that are then compiled for any target.
+
+```sh
+# 0) once: build the lifting tools (SR/llasm + llasm)
 tools/build-tools.sh
 
-# 1) lift dei due binari: da PE a .llasm, e da .llasm a LLVM IR (LLASM_TO_IR=1, default)
-tools/lift.sh /percorso/StarCraft.exe build/lift-full/StarCraft.llasm
-tools/lift.sh /percorso/storm.dll    build/lift-full/storm.llasm
+# 1) lift the two binaries: PE to .llasm, and .llasm to LLVM IR (LLASM_TO_IR=1, the default)
+tools/lift.sh /path/to/StarCraft.exe build/lift-full/StarCraft.llasm
+tools/lift.sh /path/to/storm.dll     build/lift-full/storm.llasm
 
-# risultati: build/lift-full/StarCraft.ll e build/lift-full/storm.ll
-# (cartella ignorata da git: sono dati derivati dal binario originale)
+# results: build/lift-full/StarCraft.ll and build/lift-full/storm.ll
+# (directory ignored by git: these are artefacts derived from the original binary)
 ```
 
-I due nomi `StarCraft.ll` e `storm.ll` in `build/lift-full/` sono quelli che la pipeline di entry si
-aspetta (`tools/build-entry-x86.sh` li verifica e si ferma con un messaggio esplicito se mancano).
+The two names `StarCraft.ll` and `storm.ll` under `build/lift-full/` are what the entry pipeline
+expects (`tools/build-entry-x86.sh` checks them and stops with an explicit message if they are
+missing).
 
-L'IR non è versionato: **deriva dal binario originale** e resta sul tuo disco.
+The IR is not versioned: **it derives from the original binary** and stays on your disk.
 
-### 5.2 Compilare per x86 32-bit (Linux)
+### 5.2 Building for x86 32-bit (Linux)
 
 ```sh
-./tools/build.sh --arch x86 --skip-entry     # riusa l'entry gia' compilato
-./tools/build.sh --arch x86                  # ricompila anche l'entry
-# prodotto: build/starcraft-x86
+./tools/build.sh --arch x86 --skip-entry     # reuse the already compiled entry
+./tools/build.sh --arch x86                  # recompile the entry too
+# output: build/starcraft-x86
 ```
 
-### 5.3 Compilare per ARMv7 hard-float (esempio: Pinebook Pro)
+### 5.3 Building for ARMv7 hard-float (example: Pinebook Pro)
 
 ```sh
-# entry per il target (genera build/lift-full/entry-armv7)
+# entry for the target (creates build/lift-full/entry-armv7)
 ./tools/build-entry-arm.sh
 
-# runtime + link per armv7a hard-float, con sysroot
+# runtime + link for armv7a hard-float, with sysroot
 ENTRY_DIR=$PWD/build/lift-full/entry-armv7 \
 SYSROOT=$PWD/build/sysroot \
   ./tools/build-runtime-armv7.sh
-# prodotto: build/starcraft-armv7
+# output: build/starcraft-armv7
 ```
 
-> **Attenzione**: usare `ENTRY_DIR=…/entry-armv7`. La cartella `build/lift-full/entry/` contiene un
-> entry ARMv6: il binario che ne esce va in `SIGSEGV` all'avvio. È l'errore più comune quando si
-> ricostruisce da zero.
+> **Warning**: use `ENTRY_DIR=…/entry-armv7`. The `build/lift-full/entry/` directory holds an ARMv6
+> entry: the resulting binary crashes with `SIGSEGV` at startup. This is the most common mistake when
+> rebuilding from scratch.
 
-### 5.4 Aggiungere una nuova architettura o piattaforma
+### 5.4 Adding a new architecture or platform
 
-Il percorso è sempre lo stesso, in cinque passi:
+The path is always the same, in five steps:
 
-1. **Triple e flag**: scegli il `--target` di clang (`armv6-…-gnueabihf`,
-   `riscv32-unknown-linux-gnu`, `aarch64-…`, …) e i flag CPU.
-2. **Entry**: `tools/build-entry-arm.sh` è il modello — copia in `tools/build-entry-<arch>.sh` e
-   cambia `TRIPLE`, `CPU_FLAGS`, `--sysroot`. Se l'IR ha puntatori a 32 bit e il target è 64 bit,
-   vedi §8.1: serve la modalità 64-bit di `llasm` (`PTROFS_64BIT`).
-3. **Seam ISA**: in `runtime/arch/<arch>/` servono solo quattro cose — dispatch indiretto,
-   bridge COM, azzeramento del guest, TLS. Sono poche centinaia di righe di assembly e sono l'unico
-   codice che *deve* essere specifico.
-4. **Runtime condiviso**: `runtime/common/` e `runtime/shim-port/elf/` si compilano così come sono.
-   Gli unici punti da toccare sono i blocchi `#if defined(__arch__)`: su questo progetto sono
-   **224 righe su 20.697**, elencate una per una in `reports/REPORT-x86-vs-arm.md`.
-5. **Presentazione**: lo shim parla SDL2 + OpenGL/GLES; su una piattaforma senza questi (framebuffer
-   diretto, KMS/DRM) si aggiunge un percorso in `host_elf.c` come per gli altri (`present_gpu`,
-   `present_gl`, framebuffer CPU).
+1. **Triple and flags**: choose clang's `--target` (`armv6-…-gnueabihf`,
+   `riscv32-unknown-linux-gnu`, `aarch64-…`, …) and the CPU flags.
+2. **Entry**: `tools/build-entry-arm.sh` is the template — copy it to `tools/build-entry-<arch>.sh`
+   and change `TRIPLE`, `CPU_FLAGS`, `--sysroot`. If the IR has 32-bit pointers and the target is
+   64-bit, see §9.1: you need llasm's 64-bit mode (`PTROFS_64BIT`).
+3. **ISA seams**: `runtime/arch/<arch>/` only needs four things — indirect dispatch, COM bridge,
+   guest zeroing, TLS. That is a few hundred lines of assembly and the only code that *must* be
+   architecture-specific.
+4. **Shared runtime**: `runtime/common/` and `runtime/shim-port/elf/` compile as they are. The only
+   places to touch are the `#if defined(__arch__)` blocks: on this project they are **224 lines out of
+   20,697**, listed one by one in `reports/REPORT-x86-vs-arm.md`.
+5. **Presentation**: the shim speaks SDL2 + OpenGL/GLES; on a platform without them (direct
+   framebuffer, KMS/DRM) you add a path in `host_elf.c` like the existing ones (`present_gpu`,
+   `present_gl`, CPU framebuffer).
 
-Verifica del passo: `./tools/build.sh --arch <arch> --skip-entry` deve produrre il binario, e
-`tools/run-isolated.sh` (o il launcher equivalente) deve arrivare al menu con `FPS > 0` e
-`mean > 0.02` su uno screenshot.
+Verification of the step: `./tools/build.sh --arch <arch> --skip-entry` must produce the binary, and
+`tools/run-isolated.sh` (or the equivalent launcher) must reach the menu with `FPS > 0` and
+`mean > 0.02` on a screenshot.
 
 ---
 
-## 6. Guida: usare il port
+## 7. Guide: using the port
 
-Il gioco cerca gli asset nella **directory corrente**: si lancia dalla cartella che li contiene.
+The game looks for its assets in the **current directory**: run it from the folder that contains them.
 
 ```sh
-cd /percorso/della/copia/di/starcraft
-/path/al/repo/build/starcraft-x86
+cd /path/to/your/starcraft/copy
+/path/to/repo/build/starcraft-x86
 ```
 
-### Variabili d'ambiente principali
+### Main environment variables
 
-| Variabile | Effetto |
+| Variable | Effect |
 |---|---|
-| `SDL_VIDEODRIVER` / `SDL_AUDIODRIVER` | `x11`/`wayland`, `pulseaudio` (o `dummy` nei test) |
-| `SC_SMACKER_SO` | percorso della `libsmacker` da caricare |
-| `SC_SKIP_INTRO=1` | salta solo il filmato introduttivo (`SC_SMACK=0` **non** è usabile: il gioco esce) |
-| `SC_PRESENT` | forza il percorso di presentazione (`cpu`, `gl`, …) |
-| `SC_GL_VERIFY=1` | confronta il frame GL col canvas CPU e stampa PASS/mismatch |
-| `SC_FPS_CAP`, `SC_FPS_SLEEP`, `SC_FPS_LOG` | pacing e log degli FPS |
-| `SC_LAN_BIND`, `SC_LAN_PORT`, `SC_DISC_PORT`, `SC_LAN_PEERS` | networking LAN |
-| `SC_CTL=1`, `SC_CTL_SOCK` | API di automazione in-process (`tools/scctl`) |
-| `SC_PRESENT_DBG`, `SC_SNP_TRACE`, `REASM_TRACE` | tracce diagnostiche |
+| `SDL_VIDEODRIVER` / `SDL_AUDIODRIVER` | `x11`/`wayland`, `pulseaudio` (or `dummy` in tests) |
+| `SC_SMACKER_SO` | path of the `libsmacker` to load |
+| `SC_SKIP_INTRO=1` | skip only the intro movie (`SC_SMACK=0` is **not** usable: the game exits) |
+| `SC_PRESENT` | force the presentation path (`cpu`, `gl`, …) |
+| `SC_GL_VERIFY=1` | compare the GL frame against the CPU canvas and print PASS/mismatch |
+| `SC_FPS_CAP`, `SC_FPS_SLEEP`, `SC_FPS_LOG` | pacing and FPS logging |
+| `SC_LAN_BIND`, `SC_LAN_PORT`, `SC_DISC_PORT`, `SC_LAN_PEERS` | LAN networking |
+| `SC_CTL=1`, `SC_CTL_SOCK` | in-process automation API (`tools/scctl`) |
+| `SC_PRESENT_DBG`, `SC_SNP_TRACE`, `REASM_TRACE` | diagnostic traces |
 
-### Multiplayer LAN fra due istanze sullo stesso host
+### LAN multiplayer between two instances on the same host
 
 ```sh
 SC_LAN_BIND=127.0.0.51 SC_DISC_PORT=16051 SC_LAN_PORT=16052 \
@@ -242,133 +297,154 @@ SC_LAN_PEERS=127.0.0.51:16051 SC_PRESENT=cpu \
   ./tools/run-isolated.sh start --id lan-b --skip-intro 1 --smack 1
 ```
 
-Poi, nelle due finestre: *Multiplayer → Original → Local Area Network (UDP) → Ok → profilo*; l'host
-crea la partita, il client la seleziona dalla lista, l'host avvia. Dettagli e diagnosi:
+Then, in the two windows: *Multiplayer → Original → Local Area Network (UDP) → Ok → profile*; the host
+creates the game, the client selects it from the list, the host starts. Details and diagnostics:
 `reports/REPORT-lan-lockstep-fix.md`, `reports/REPORT-lan-step2b.md`.
 
-### Automazione e verifica senza guardare lo schermo
+### Automation and verification without looking at the screen
 
 ```sh
-SC_PRESENT=cpu ./tools/run-isolated.sh start --id prova --skip-intro 1 --smack 1
-python3 tools/scctl --sock build/isolated/prova/sandbox/sc-ctl.sock shot /tmp/f.png
-tools/shot-stat.sh /tmp/f.png        # media/max/deviazione: "è nero o c'è contenuto?"
-./tools/run-isolated.sh stop --id prova
+SC_PRESENT=cpu ./tools/run-isolated.sh start --id check --skip-intro 1 --smack 1
+python3 tools/scctl --sock build/isolated/check/sandbox/sc-ctl.sock shot /tmp/f.png
+tools/shot-stat.sh /tmp/f.png        # mean/max/standard deviation: "is it black or is there content?"
+./tools/run-isolated.sh stop --id check
 ```
 
-`sc_ctl` espone `shot`, `rawshot`, `click`, `move`, `down`, `up`, `key`, `keydown`, `keyup`, `text`,
-`state`. I clic vanno inviati come `move` → `down` → pausa ~250 ms → `up`: con un click a latenza zero
-la UI del gioco non lo registra.
+`sc_ctl` exposes `shot`, `rawshot`, `click`, `move`, `down`, `up`, `key`, `keydown`, `keyup`, `text`,
+`state`. Clicks must be sent as `move` → `down` → ~250 ms pause → `up`: with a zero-latency click the
+game's UI does not register it.
 
 ---
 
-## 7. Test e verifica
+## 8. Tests and verification
 
 ```sh
-for t in tests/*/check.sh; do echo "== $t"; bash "$t"; done    # 9 verifiche, x86
+for t in tests/*/check.sh; do echo "== $t"; bash "$t"; done    # 9 checks, x86
 ```
 
-Coprono: ABI degli shim (stdcall/`ret N`), decompressore SComp (4292/4292 settori byte-exact),
-kernel SCode (parità interprete/LUT su larghezze 1..364), palette GL (307.200 pixel esatti),
-mappatura della memoria guest, pool di memoria virtuale, affinità di thread, IO readahead, API `sc_ctl`.
+They cover: shim ABI (stdcall/`ret N`), the SComp decompressor (4292/4292 sectors byte-exact), the
+SCode kernel (interpreter/LUT parity for widths 1..364), the GL palette (307,200 exact pixels), guest
+memory mapping, the virtual memory pool, thread affinity, IO readahead, the `sc_ctl` API.
 
-Oltre ai test, il progetto usa due forme di verifica che valgono più di una suite:
+Beyond the tests, the project relies on two forms of verification that are worth more than a suite:
 
-- **confronto con l'oracolo** (`reports/ANALYSIS-*.md`): ogni contratto è provato sul decompilato,
-  con indirizzo citato;
-- **verifica numerica degli screenshot** (`tools/shot-stat.sh`): luminanza media, massimo, deviazione
-  standard al posto dell'ispezione visiva — così una regressione grafica è un numero, non
-  un'impressione (vedi `docs/POLICY-immagini.md`).
+- **comparison with the oracle** (`reports/ANALYSIS-*.md`): every contract is proven against the
+  decompiled binary, with the address cited;
+- **numeric verification of screenshots** (`tools/shot-stat.sh`): mean luminance, maximum and standard
+  deviation instead of visual inspection — so a graphics regression is a number, not an impression
+  (see `docs/POLICY-immagini.md`).
 
 ---
 
-## 8. Sviluppi futuri
+## 9. Future work
 
-### 8.1 Altre architetture e piattaforme
+### 9.1 ARMv6 and the Raspberry Pi Zero — the minimum hardware target
 
-- **ARMv7 / ARMv6**: fatti. Il target ARMv6 (Raspberry Pi 1/Zero) ha una pipeline separata
-  (`tools/build-runtime-arm.sh`) e un report di prova in QEMU (`reports/REPORT-armv6-native-qemu.md`).
-- **64-bit (x86_64, aarch64, riscv64)**: il blocco non è il compilatore, è l'IR: i file `.ll`
-  attuali usano puntatori a 32 bit (`p:32:32`, `inttoptr i32`), mentre il guest deve continuare a
-  vedere indirizzi a 32 bit. Il percorso previsto, già individuato in `PLAN-MULTIARCH.md` §7.2, è:
-  1. usare la modalità 64-bit di `llasm` (`PTROFS_64BIT`, `REG2PTR`/`PTR2REG`), così il guest mantiene
-     indirizzi `uint32_t` mentre il codice generato usa puntatori a 64 bit;
-  2. estendere `tools/dispatch-ir.py` alle forme `inttoptr i64`/`ptrtoint … to i64`;
-  3. marshalling `uint32_t` ↔ `uintptr_t` negli shim dove i puntatori guest vengono tradotti
-     in puntatori host;
-  4. verificare le arità `stdcall` e `va_list` per le ABI LP64 (System V AMD64 / AAPCS64).
-  Fatto questo, il resto del runtime è già arch-neutro: il port 64-bit è lavoro di *pipeline*, non
-  di reimplementazione.
-- **RISC-V 32/64, LoongArch, PowerPC**: stesso schema a cinque passi di §5.4; per i 32 bit
-  little-endian l'IR funziona senza rigenerarlo.
-- **Piattaforme senza X11/Wayland** (framebuffer, KMS/DRM, console portatili): serve un percorso di
-  presentazione dedicato in `host_elf.c` (il codice è già organizzato in percorsi separati: CPU
+There is a **second ARM pipeline**, `tools/build-runtime-arm.sh`, targeting **ARMv6 + VFPv2 without
+NEON** — that is the Raspberry Pi 1 and the **Pi Zero**. It is **experimental**: the binary builds and
+runs, but it has **not been validated on real hardware yet**; the only run so far is in QEMU
+(`reports/REPORT-armv6-native-qemu.md`).
+
+The Pi Zero (single-core ARM1176JZF-S at 1 GHz, 512 MB, VideoCore IV) is the **absolute minimum
+hardware we aim for**. It is the honest stress test: no NEON, no hardware 3D worth using, one core. If
+the port is usable there, it is comfortable on anything above it. What is already in place for it:
+scalar VFP paths in the blitters and in the guest CPU helpers, a software palette LUT for the
+framebuffer path, and the elimination of the per-call `/proc/self/maps` parsing that used to dominate
+the profile. What is missing: measurement and tuning on the device itself — frame pacing, the cost of
+the intro movies, and the memory ceiling (512 MB shared with the GPU).
+
+### 9.2 Other architectures and platforms
+
+- **ARMv7**: done and validated on hardware (Pinebook Pro). **ARMv6 / Pi Zero**: pipeline ready,
+  validation on hardware still to do — see §9.1.
+- **64-bit (x86_64, aarch64, riscv64)**: the blocker is not the compiler, it is the IR: the current
+  `.ll` files use 32-bit pointers (`p:32:32`, `inttoptr i32`), while the guest must keep seeing 32-bit
+  addresses. The planned path, already identified in `PLAN-MULTIARCH.md` §7.2, is:
+  1. use llasm's 64-bit mode (`PTROFS_64BIT`, `REG2PTR`/`PTR2REG`), so that the guest keeps
+     `uint32_t` addresses while the generated code uses 64-bit pointers;
+  2. extend `tools/dispatch-ir.py` to the `inttoptr i64`/`ptrtoint … to i64` forms;
+  3. marshal `uint32_t` ↔ `uintptr_t` in the shims where guest pointers are translated into host
+     pointers;
+  4. verify `stdcall` arities and `va_list` for the LP64 ABIs (System V AMD64 / AAPCS64).
+  Once that is done, the rest of the runtime is already architecture-neutral: the 64-bit port is
+  *pipeline* work, not reimplementation.
+- **RISC-V 32/64, LoongArch, PowerPC**: same five-step scheme as §5.4; for 32-bit little-endian
+  targets the existing IR works without regenerating it.
+- **Platforms without X11/Wayland** (framebuffer, KMS/DRM, handheld consoles): a dedicated
+  presentation path is needed in `host_elf.c` (the code is already organised in separate paths: CPU
   framebuffer, GPU texture, GL/GLES).
-- **Piattaforme non-Linux** (BSD, macOS): gli shim usano chiamate POSIX + SDL2; il lavoro è
-  soprattutto nella mappatura dei percorsi (`/proc`, `mmap`, thread affinity) e nel loader.
+- **Non-Linux platforms** (BSD, macOS): the shims use POSIX calls + SDL2; the work is mostly in path
+  mapping (`/proc`, `mmap`, thread affinity) and in the loader.
+- **Any other target**: the project is deliberately structured so that adding a platform is a matter
+  of *pipeline*, not of rewriting the port. The evidence is in the repository itself: two
+  architectures already share 98.9% of the same source (`reports/REPORT-x86-vs-arm.md`), the guest
+  code is compiled from one single IR, and the architecture-specific surface is four small assembly
+  files plus 224 conditional lines. Concretely, the candidates we consider realistic are 32-bit
+  RISC-V boards, ARM boards with weak or absent GPUs (where the CPU framebuffer path is used), and
+  retro handhelds/consoles that expose a framebuffer and SDL2 — each of them a self-contained
+  experiment that does not destabilise the existing ports.
 
-### 8.2 Un Battle.net privato, personalizzabile
+### 9.3 A private, customisable Battle.net
 
-Oggi il multiplayer passa dal provider SNP UDP nativo del gioco (`standard.snp`), che abbiamo
-reimplementato: discovery, lista partite, join e lockstep funzionano. **Battle.net non è supportato**,
-e questa è la parte con più margine di sviluppo interessante, perché un server privato permette cose
-che il servizio originale non permetteva più.
+Today multiplayer goes through the game's native SNP UDP provider (`standard.snp`), which we have
+reimplemented: discovery, game list, join and lockstep all work. **Battle.net is not supported**, and
+this is the area with the most interesting room for growth, because a private server allows things
+the original service no longer did.
 
-Tre strade, in ordine di invasività crescente:
+Three routes, in order of increasing invasiveness:
 
-1. **Server compatibile (PvPGN o simile) + client che parla BNCS.** Il server esiste già; manca il
-   client: nel nostro port bisogna far parlare il gioco con un server TCP. Le due opzioni tecniche
-   sono (a) *liftare* anche `battle.snp` — il PE che implementa il protocollo Battle.net — e fornirgli
-   gli shim Winsock che oggi non esistono (18 ordinali `WSOCK32`), più la lettura dei gateway dal
-   registro (`Software\Battle.net\Configuration`); oppure (b) scrivere un **provider nativo** che
-   implementa direttamente il protocollo verso il server, saltando `battle.snp`.
-2. **Battle.net "locale" con funzionalità nuove.** Con un server nostro si può aggiungere ciò che
-   l'originale non aveva o ha perso: stanza chat persistente con storico, lobby con ricerca partite,
-   spettatori, replay condivisi lato server, statistiche e ladder, autenticazione moderna (senza
-   CD-key), server che gira su una Raspberry o in un container.
-3. **Interoperabilità.** Un server nostro può parlare sia BNCS (per client originali o via Wine) sia
-   un protocollo nuovo (JSON/WebSocket) per un client moderno o un bot, e fungere da ponte fra i due.
+1. **A compatible server (PvPGN or similar) plus a client that speaks BNCS.** The server already
+   exists; the client is missing: in our port the game must talk to a TCP server. The two technical
+   options are (a) also *lift* `battle.snp` — the PE that implements the Battle.net protocol — and give
+   it the Winsock shims that do not exist today (18 `WSOCK32` ordinals), plus reading the gateways from
+   the registry (`Software\Battle.net\Configuration`); or (b) write a **native provider** that
+   implements the protocol towards the server directly, skipping `battle.snp`.
+2. **A "local" Battle.net with new features.** With our own server we can add what the original never
+   had or has lost: a persistent chat room with history, a lobby with game search, spectators,
+   server-side shared replays, statistics and ladders, modern authentication (no CD key), a server that
+   runs on a Raspberry Pi or in a container.
+3. **Interoperability.** Our server can speak both BNCS (for original clients or via Wine) and a new
+   protocol (JSON/WebSocket) for a modern client or a bot, acting as a bridge between the two.
 
-Attenzione ai vincoli: `battle.snp` è codice di Blizzard (non ridistribuibile: il lifting resta
-locale), l'autenticazione originale si basa su CD-key (un server privato deve decidere come
-sostituirla), e il protocollo Battle.net classico è documentato solo da reverse engineering
-comunitario (il nostro approccio è in `PLAN-MULTIPLAYER.md` §4 con l'analisi in
-`reports/ANALYSIS-snp-contracts.md`).
+Mind the constraints: `battle.snp` is Blizzard code (not redistributable: lifting stays local), the
+original authentication is CD-key based (a private server must decide how to replace it), and the
+classic Battle.net protocol is documented only by community reverse engineering (our approach is in
+`PLAN-MULTIPLAYER.md` §4 with the analysis in `reports/ANALYSIS-snp-contracts.md`).
 
-### 8.3 Altro lavoro aperto
+### 9.4 Other open work
 
-- **Determinismo del multiplayer**: misurare il lockstep con un checksum di stato per escludere
-  desync (in particolare cross-arch, dove x87 a 80 bit e `double` a 64 bit potrebbero divergere).
-- **Robustezza di rete**: host che sparisce, TTL delle voci in lista, ripresa dopo perdita di pacchetti.
-- **Performance**: `PLAN-PERF-OPT.md` ha ancora fasi aperte (cache della mappatura di memoria
-  invalidata dalle `VirtualAlloc`, accelerazione del codice caldo di Storm via `reasm_extern`,
-  tuning per ARM).
-- **Suite di test per ARM**: oggi le nove verifiche automatiche sono solo x86; su ARM la verifica è
-  manuale o via `sc_ctl`.
+- **Multiplayer determinism**: measure lockstep with a state checksum to rule out desync (especially
+  cross-architecture, where 80-bit x87 and 64-bit `double` could diverge).
+- **Network robustness**: disappearing host, game-list entry TTL, recovery after packet loss.
+- **Performance**: `PLAN-PERF-OPT.md` still has open phases (memory-mapping cache invalidated by
+  `VirtualAlloc`, accelerating Storm's hot code via `reasm_extern`, ARM tuning).
+- **ARM test suite**: today the nine automatic checks are x86 only; on ARM verification is manual or
+  through `sc_ctl`.
 
 ---
 
-## 9. Struttura del repository
+## 10. Repository layout
 
-| Percorso | Contenuto |
+| Path | Content |
 |---|---|
-| `runtime/common/` | runtime condiviso fra le architetture (CPU guest, memoria, dispatch, SCode, SComp) |
-| `runtime/arch/{arm,x86}/` | seam in assembly specifici dell'ISA |
-| `runtime/shim-port/elf/` | shim Win32/DirectDraw/DirectSound/GDI/Smacker/SNet + presentazione SDL2/GL |
-| `tools/` | pipeline di build, lifting, generazione bridge, `scctl`, sandbox `run-isolated.sh` |
-| `tests/` | verifiche eseguibili, tutte senza interfaccia grafica |
-| `reports/` | analisi (oracolo IDA), report di fase, misure — **indice in `reports/INDEX.md`** |
-| `docs/` | policy e note trasversali |
-| `vendor/` | componenti di terzi (SR/llasm, udis86, libsmacker) con le loro licenze |
+| `runtime/common/` | runtime shared between architectures (guest CPU, memory, dispatch, SCode, SComp) |
+| `runtime/arch/{arm,x86}/` | ISA-specific assembly seams |
+| `runtime/shim-port/elf/` | Win32/DirectDraw/DirectSound/GDI/Smacker/SNet shims + SDL2/GL presentation |
+| `tools/` | build pipeline, lifting, bridge generation, `scctl`, `run-isolated.sh` sandbox |
+| `tests/` | executable checks, all without a graphical interface |
+| `reports/` | analyses (IDA oracle), phase reports, measurements — **index in `reports/INDEX.md`** |
+| `docs/` | policies and cross-cutting notes |
+| `vendor/` | third-party components (SR/llasm, udis86, libsmacker) with their own licences |
 
 ---
 
-## 10. Licenza, dati di gioco e marchi
+## 11. Licence, game data and trademarks
 
-- **Codice di questo progetto**: GNU General Public License v3.0 — vedi [`LICENSE`](LICENSE).
-- **Componenti di terzi**: licenze proprie, elencate in [`THIRD-PARTY.md`](THIRD-PARTY.md)
-  (SR/llasm MIT, udis86 BSD, libsmacker LGPL 2.1 caricata a runtime).
-- **Nessun asset o binario del gioco** è incluso o ridistribuito: servono una copia personale e
-  legittima di StarCraft/Brood War 1.16.1, e gli artefatti derivati dal lifting (IR, oggetti, database
-  IDA) restano sulla macchina dell'utente, esclusi dal versionamento.
-- StarCraft, Brood War, Battle.net e Blizzard Entertainment sono marchi di Blizzard Entertainment,
-  Inc. Questo progetto **non è affiliato né approvato** da Blizzard.
+- **This project's code**: GNU General Public License v3.0 — see [`LICENSE`](LICENSE).
+- **Third-party components**: their own licences, listed in [`THIRD-PARTY.md`](THIRD-PARTY.md)
+  (SR/llasm MIT, udis86 BSD, libsmacker LGPL 2.1 loaded at runtime).
+- **No game assets or binaries** are included or redistributed: you need your own, legitimate copy of
+  StarCraft/Brood War 1.16.1, and the artefacts derived from lifting (IR, objects, IDA databases) stay
+  on the user's machine, excluded from version control.
+- StarCraft, Brood War, Battle.net and Blizzard Entertainment are trademarks of Blizzard
+  Entertainment, Inc. This project is **not affiliated with or endorsed by** Blizzard.
