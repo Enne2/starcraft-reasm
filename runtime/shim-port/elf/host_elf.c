@@ -1311,6 +1311,9 @@ static unsigned int fb_dx, fb_dy, fb_dw, fb_dh;   /* finestra 4:3 dentro il pann
 static unsigned int fb_xmap[4096];                /* colonna dst -> colonna src in 16.16 */
 static unsigned int fb_ymap[4096];                /* riga dst   -> riga src   in 16.16 */
 static unsigned int fb_src_w, fb_src_h;           /* canvas a cui le mappe si riferiscono */
+static unsigned int fb_pal32[256];                /* palette gia' pronta per XRGB8888 */
+static unsigned short fb_pal16[256];              /* palette gia' pronta per RGB565 */
+static int fb_lut_valid;                          /* LUT coerente con g_pal */
 
 static void fb_put(const char *s) { reasm_elf_log(s); }
 static void fb_putn(unsigned int v)
@@ -1385,24 +1388,66 @@ static void fb_build_maps(void)
     fb_src_w = (unsigned int) g_w; fb_src_h = (unsigned int) g_h;
 }
 
+/* LUT della palette: si ricostruisce solo quando la palette cambia (g_pal_dirty e' alzato da
+ * host_elf_set_palette e azzerato da present_snapshot_commit). Toglie una AND e una lettura
+ * da 4 byte per pixel dal ciclo caldo. */
+static void fb_build_lut(void)
+{
+    unsigned int i;
+    if (fb_lut_valid && !g_pal_dirty) return;
+    for (i = 0; i < 256u; ++i) {
+        unsigned int c = g_pal[i];
+        fb_pal32[i] = c & 0x00FFFFFFu;
+        fb_pal16[i] = (unsigned short) ((((c >> 16) & 0xFFu) >> 3 << 11) |
+                                        (((c >> 8) & 0xFFu) >> 2 << 5) |
+                                        ((c & 0xFFu) >> 3));
+    }
+    fb_lut_valid = 1;
+}
+
+/* Conversione + copia. Il caso dei target reali (canvas 640x480, area 640x480) e' 1:1:
+ * niente mappe, solo LUT + store a parola. Il percorso con mappe resta per il letterbox
+ * con scala diversa. */
 static void fb_draw(void)
 {
-    unsigned int i, j, c;
+    unsigned int i, j;
+    fb_build_lut();
+    if (fb_dw == (unsigned int) g_w && fb_dh == (unsigned int) g_h) {
+        for (j = 0; j < fb_dh; ++j) {
+            const unsigned char *s = g_canvas + (unsigned long) j * (unsigned long) g_pitch;
+            unsigned char *drow = fb_mem + (unsigned long) (fb_dy + j) * (unsigned long) fb_line;
+            if (fb_bpp == 32) {
+                unsigned int *p = (unsigned int *) (drow + (unsigned long) fb_dx * 4ul);
+                for (i = 0; i + 4u <= fb_dw; i += 4u) {
+                    p[i]     = fb_pal32[s[i]];
+                    p[i + 1] = fb_pal32[s[i + 1]];
+                    p[i + 2] = fb_pal32[s[i + 2]];
+                    p[i + 3] = fb_pal32[s[i + 3]];
+                }
+                for (; i < fb_dw; ++i) p[i] = fb_pal32[s[i]];
+            } else {
+                unsigned short *p = (unsigned short *) (drow + (unsigned long) fb_dx * 2ul);
+                for (i = 0; i + 4u <= fb_dw; i += 4u) {
+                    p[i]     = fb_pal16[s[i]];
+                    p[i + 1] = fb_pal16[s[i + 1]];
+                    p[i + 2] = fb_pal16[s[i + 2]];
+                    p[i + 3] = fb_pal16[s[i + 3]];
+                }
+                for (; i < fb_dw; ++i) p[i] = fb_pal16[s[i]];
+            }
+        }
+        return;
+    }
     fb_build_maps();
     for (j = 0; j < fb_dh; ++j) {
         const unsigned char *src = g_canvas + (unsigned long) (fb_ymap[j] >> 16) * (unsigned long) g_pitch;
         unsigned char *drow = fb_mem + (unsigned long) (fb_dy + j) * (unsigned long) fb_line;
         if (fb_bpp == 32) {
             unsigned int *p = (unsigned int *) (drow + (unsigned long) fb_dx * 4ul);
-            for (i = 0; i < fb_dw; ++i) { c = g_pal[src[fb_xmap[i] >> 16]]; p[i] = c & 0x00FFFFFFu; }
+            for (i = 0; i < fb_dw; ++i) p[i] = fb_pal32[src[fb_xmap[i] >> 16]];
         } else {
             unsigned short *p = (unsigned short *) (drow + (unsigned long) fb_dx * 2ul);
-            for (i = 0; i < fb_dw; ++i) {
-                unsigned int r, g, b;
-                c = g_pal[src[fb_xmap[i] >> 16]];
-                r = (c >> 16) & 0xFFu; g = (c >> 8) & 0xFFu; b = c & 0xFFu;
-                p[i] = (unsigned short) (((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
-            }
+            for (i = 0; i < fb_dw; ++i) p[i] = fb_pal16[src[fb_xmap[i] >> 16]];
         }
     }
 }
@@ -1497,7 +1542,30 @@ static void host_present_frame(int movie) {
     }
     if (fb_present_requested()) {
 #if defined(__arm__)
-        if (fb_open() == 0) { fb_draw(); present_snapshot_commit(SDL_GetTicks()); return; }
+        if (fb_open() == 0) {
+            fb_draw();
+            /* FPS/statistica del percorso framebuffer: presenta/s e costo medio del present
+             * misurato in microsecondi non servirebbe qui (niente timer ad alta risoluzione
+             * nel file): si confronta con SC_PRESENT=dummy per isolare il costo. */
+            {   static int fps_en = -1;
+                static unsigned int start, frames;
+                unsigned int t = SDL_GetTicks();
+                if (fps_en < 0) fps_en = getenv("SC_FPS_LOG") != 0;
+                if (fps_en) {
+                    ++frames;
+                    if (!start) start = t;
+                    if (t - start >= 1000u) {
+                        char b[96];
+                        snprintf(b, sizeof b, "[fps] FB %u fps, %ux%u -> %ux%u, bpp %u\n",
+                                 frames * 1000u / (t - start), (unsigned) g_w, (unsigned) g_h,
+                                 fb_dw, fb_dh, fb_bpp);
+                        reasm_elf_log(b);
+                        start = t; frames = 0;
+                    }
+                }
+            }
+            present_snapshot_commit(SDL_GetTicks()); return;
+        }
         reasm_elf_log("[host] present: framebuffer non disponibile, torno al percorso SDL\n");
 #else
         reasm_elf_log("[host] present: SC_PRESENT=fb non supportato su questa piattaforma\n");

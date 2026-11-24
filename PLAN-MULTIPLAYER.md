@@ -12,6 +12,30 @@
 
 ---
 
+## STATO (aggiornato al 2026-11-24, dopo la ricognizione)
+
+> **Questa sezione prevale sulle tabelle sottostanti, che riflettono le ipotesi del 22 novembre.**
+> Contratti e stato misurati: `reports/ANALYSIS-snp-contracts.md` (IDA su `standard.snp` e `storm`),
+> `reports/REPORT-lan-step1..3.md`, `reports/REPORT-lan-lockstep-fix.md`.
+
+| Fatto | Evidenza |
+|---|---|
+| Discovery UDP **6111**, gioco UDP **6112**, due socket separati | `ANALYSIS-snp-contracts.md` §"socket e indirizzo" |
+| Wire format provato: checksum Fletcher mod 255 all'indietro, len, tipo 0/1/2, product, versione, flags, `name\0 statstring\0 blob` | idem §"Discovery" |
+| Nodo `SnpGame` = **0x13C** byte con offset provati (`+0x0C` host inline, `+0x20` tick, `+0x28` name, `+0xA8` statstring, `+0x128` next, `+0x12C` blob, `+0x130` len, `+0x134` product, `+0x138` versione) | idem §2 |
+| TTL voce **10 s**; Lock restituisce un prestito, Unlock scrive il poll hint **500 ms** e manda un probe ogni ≥400 ms | idem §3 |
+| **`+0x40` è l'advertising vero (10 argomenti, `ret 0x28`)** — non `+0x50` | idem §4 |
+| **`+0x50` è un'altra callback** (4 argomenti, due buffer di uscita da 128): NON l'advertising | idem §5 |
+| **`+0x34` `spiSelectGame` ha 6 argomenti** (`ret 0x18`) | idem §5 |
+| `+0x18` `spiGetPerformanceData`: Storm **non usa il valore di ritorno** (`0x15037372`) | `reports/LAN-probe-h2.md` |
+| `+0x58` è **nullo** nella tabella del provider originale | idem |
+| Lockstep: la perdita era nel nostro percorso di ricezione (throttle + buffer kernel), non nel protocollo | `reports/REPORT-lan-lockstep-fix.md` |
+
+Stato funzionale: due istanze sullo stesso host vedono la partita in lista, il client entra e la partita
+**parte e resta giocabile** (≥60 s, scambio turni simmetrico). Restano aperti: prova su due macchine
+fisiche, determinismo dei turni (checksum di stato), robustezza host-lost, slot periferici
+(`±ExternalMessage`, `ReportGameResult`, `CheckDataFile`, 5× `League*`) e tutto Battle.net.
+
 ## 0. Regole operative obbligatorie per l'agente esecutore
 
 1. **Oracolo primario (IDA Pro):** mai dedurre layout, offset di struct, arità `stdcall` (`ret N`), porte o framing di rete a tentoni. Decompilare e verificare in IDA:
@@ -57,17 +81,17 @@
 | `+0x1C` | `spiInitialize` | `snp_initialize` | Implementato (socket UDP) | Verificare i 5 argomenti (`client`, `user`, `battle`, `module`, `event` HANDLE per async wakeup!) |
 | `+0x20` | `spiInitializeDevice` | `snp_initialize_device` | `FALSE` | Corretto per UDP (nessun modem/cavo) |
 | `+0x24` | `spiLockDeviceList` | `snp_lock_device_list` | `TRUE`, `*devices=NULL` | Corretto per UDP |
-| `+0x28` | `spiLockGameList` | `snp_lock_game_list` | **Stub vuoto (`*games=NULL`)** | **BLOCCANTE LAN:** restituire lista `SnpGame` da discovery/broadcast |
+| `+0x28` | `spiLockGameList` | `snp_lock_game_list` | **IMPLEMENTATO** (lista reale, TTL 10 s) | **BLOCCANTE LAN:** restituire lista `SnpGame` da discovery/broadcast |
 | `+0x2C` | `spiReceive` | `snp_receive` | Implementato (`recvfrom`) | Segnalazione `event` di `spiInitialize` e interoperabilità `SNETADDR` |
 | `+0x30` | `spiReceiveExternalMessage` | `snp_receive_external` | Fail-closed (`FALSE`) | Solo se usato da Battle.net / external |
-| `+0x34` | `spiSelectGame` | `snp_unknown_select_game` | **Stub fail-closed (`FALSE`)** | **BLOCCANTE LAN:** join / selezione partita in lobby (`arità` e `arg` da verificare in Storm/standard.snp) |
+| `+0x34` | `spiSelectGame` | `snp_select_game` | **IMPLEMENTATO** (6 argomenti; join verificato) | **BLOCCANTE LAN:** join / selezione partita in lobby (`arità` e `arg` da verificare in Storm/standard.snp) |
 | `+0x38` | `spiSend` | `snp_send` | Implementato (`sendto`) | Verificare formato reale `SnpNetAddress` (`SNETADDR`) con Storm |
 | `+0x3C` | `spiSendExternalMessage` | `snp_send_external` | Fail-closed (`FALSE`) | Battle.net / chat esterna |
-| `+0x40` | `spiStartAdvertisingLadderGame` | `snp_start_advertising_ladder` | Registra `g_game` locale | Solo ladder/SP (`#138`); verificare eventuale uso in LAN |
-| `+0x44` | `spiStopAdvertisingGame` | `snp_stop_advertising` | Pulisce `g_game` locale | Fermare broadcast/beacon LAN quando host chiude lobby |
+| `+0x40` | **`spiStartAdvertisingGame` (advertising vero, 10 argomenti)** | `snp_start_advertising_ladder` | **IMPLEMENTATO**: datagramma tipo 0 su 6111 | Solo ladder/SP (`#138`); verificare eventuale uso in LAN |
+| `+0x44` | `spiStopAdvertisingGame` | `snp_stop_advertising` | **IMPLEMENTATO**: invia il ritiro (tipo 1) | Fermare broadcast/beacon LAN quando host chiude lobby |
 | `+0x48` | `spiUnlockDeviceList` | `snp_unlock_device_list` | `TRUE` | Corretto per UDP |
-| `+0x4C` | `spiUnlockGameList` | `snp_unlock_game_list` | `TRUE` no-op | Rilasciare / sbloccare eventuale lista allocata in `spiLockGameList` |
-| `+0x50` | `spiStartAdvertisingGame` | `snp_start_advertising` | **Solo locale (`g_game`)** | **BLOCCANTE LAN:** inviare beacon UDP / rispondere ai probe di discovery |
+| `+0x4C` | `spiUnlockGameList` | `snp_unlock_game_list` | **IMPLEMENTATO**: poll hint 500 ms + probe | Rilasciare / sbloccare eventuale lista allocata in `spiLockGameList` |
+| `+0x50` | **callback diverse dall'advertising** (4 arg, due buffer di uscita 128) | `snp_start_advertising` | fail-closed (semantica non provata) | **BLOCCANTE LAN:** inviare beacon UDP / rispondere ai probe di discovery |
 | `+0x54` | `spiReportGameResult` | `snp_unknown_report_result` | Fail-closed (`FALSE`) | Ladder / fine partita Battle.net |
 | `+0x58` | `spiCheckDataFile` | `snp_check_data_file` | `FALSE`, `*available=0` | Verificare chiamata in multi/Battle.net |
 | `+0x5C..+0x6C` | `spiLeague*` (5 slot) | `snp_league_*` | Fail-closed (`FALSE`) | Solo Battle.net ladder/replay |
