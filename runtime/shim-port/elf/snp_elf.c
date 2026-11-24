@@ -198,6 +198,8 @@ static int g_adv_active;
 static u32 g_product = 0x53544152u;   /* 'STAR' (StarCraft.exe 0x004727A2) */
 static u32 g_version = 0xD3u;        /* 0xD3 (StarCraft.exe 0x004727BF) */
 static u32 g_last_probe_ms;
+static u32 g_game_port = SNP_GAME_PORT_DEFAULT;   /* porta UDP di gioco effettiva (SC_LAN_PORT) */
+static u32 g_disc_port = SNP_DISC_PORT_DEFAULT;   /* porta UDP di discovery effettiva (SC_DISC_PORT) */
 
 /* Tempo monotono in ms, usato per TTL e cadenza del probe. */
 static u32 snp_now_ms(void) {
@@ -304,6 +306,7 @@ static int open_loopback_socket(void) {
     (void)setsockopt(fd, SNP_SOL_SOCKET, SNP_SO_BROADCAST, &one, sizeof one);
     if (bind(fd, &local, sizeof local) != 0) { close(fd); return -1; }
     { int flags = fcntl(fd, SNP_F_GETFL, 0); if (flags < 0 || fcntl(fd, SNP_F_SETFL, flags | SNP_O_NONBLOCK) < 0) { close(fd); return -1; } }
+    g_game_port = port;
     g_net_poll_ms = net_poll_interval_ms();
     g_poll_socket_fd = fd;
     g_last_poll_valid = 0;
@@ -384,16 +387,16 @@ static void disc_send_to(const struct SnpSockaddrIn *to, const unsigned char *bu
 static void disc_broadcast(const unsigned char *buf, u32 len) {
     struct SnpSockaddrIn to;
     u32 i;
-    addr_set(&to, 0xFFFFFFFFu, (u16)SNP_DISC_PORT_DEFAULT);
+    addr_set(&to, 0xFFFFFFFFu, (u16)g_disc_port);
     disc_send_to(&to, buf, len);
     /* Broadcast limitato all'interfaccia di loopback (127.255.255.255): il broadcast globale non
      * esce su lo e due istanze sullo stesso host con IP 127.0.0.x non si vedrebbero. Nessun
      * effetto sulle reti reali (indirizzo di loopback). */
-    addr_set(&to, 0xFFFFFF7Fu, (u16)SNP_DISC_PORT_DEFAULT);
+    addr_set(&to, 0xFFFFFF7Fu, (u16)g_disc_port);
     disc_send_to(&to, buf, len);
     for (i = 0; i < g_peer_count; ++i) {
         to = g_peers[i];
-        to.port = net_port((u16)SNP_DISC_PORT_DEFAULT);
+        to.port = net_port((u16)g_disc_port);
         disc_send_to(&to, buf, len);
     }
     if (snp_trace_on()) {
@@ -557,7 +560,7 @@ static void disc_handle(const unsigned char *buf, u32 len, const struct SnpSocka
     if (type != SNP_WIRE_TYPE_ANNOUNCE && type != SNP_WIRE_TYPE_WITHDRAW) return;
     /* Chiave = sockaddr_in con porta normalizzata a 6112 (snp:1D0089B6). */
     key = *from;
-    key.port = net_port((u16)SNP_GAME_PORT_DEFAULT);
+    key.port = net_port((u16)g_game_port);
     if (type == SNP_WIRE_TYPE_WITHDRAW) node_remove(&key);
     else node_upsert(&key, buf, len, now);
 }
@@ -607,6 +610,7 @@ static int open_discovery_socket(void) {
     if (bind(fd, &local, sizeof local) != 0) { close(fd); return -1; }
     { int flags = fcntl(fd, SNP_F_GETFL, 0);
       if (flags < 0 || fcntl(fd, SNP_F_SETFL, flags | SNP_O_NONBLOCK) < 0) { close(fd); return -1; } }
+    g_disc_port = port;
     return fd;
 }
 
@@ -916,8 +920,12 @@ static int receive_packet(struct SnpNetAddress **address, char **data, u32 *byte
     *address = &packet->address; *data = packet->data; *bytes = (u32)n;
     if (snp_trace_on()) {
         static int rx_logged;
-        if (rx_logged < 40) {
+        if (rx_logged < 200) {
             ++rx_logged;
+            snp_log("[snp-trace] hex=");
+            {   int k, lim = n > 32 ? 32 : n;
+                for (k = 0; k < lim; ++k) reasm_elf_log_hex((u32)(unsigned char)payload[k]); }
+            snp_log(" ");
             snp_log("[snp-trace] recv len="); reasm_elf_log_hex((u32)n);
             snp_log(" da="); reasm_elf_log_hex(get32((const unsigned char *)&from + 4));
             snp_log(":"); reasm_elf_log_hex(net_port(from.port)); snp_log("\n");
