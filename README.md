@@ -355,6 +355,11 @@ the intro movies, and the memory ceiling (512 MB shared with the GPU).
 
 ### 9.2 Other architectures and platforms
 
+**This project is meant to be considered as a base for further ports — to other *hardware*
+architectures and to other *software* platforms.** What follows is the concrete list, and the reason
+it is realistic: the lifting pipeline and the runtime were built so that the game's code is compiled
+once into IR and then retargeted, instead of being rewritten per platform.
+
 - **ARMv7**: done and validated on hardware (Pinebook Pro). **ARMv6 / Pi Zero**: pipeline ready,
   validation on hardware still to do — see §9.1.
 - **64-bit (x86_64, aarch64, riscv64)**: the blocker is not the compiler, it is the IR: the current
