@@ -331,7 +331,7 @@ SHIM(snp_start_advertising, 4, 4, 0)
 SHIM(snp_start_advertising_ladder, 10, 10, 0)
 SHIM(snp_stop_advertising, 0, 0, 0)
 SHIM(snp_unknown_report_result, 0, 0, 0)
-SHIM(snp_unknown_select_game, 0, 0, 0)
+SHIM(snp_select_game, 6, 6, 0)   /* slot +0x34: ret 0x18 (storm:1503906A) */
 SHIM(snp_unlock_device_list, 1, 1, 0)
 SHIM(snp_unlock_game_list, 2, 2, 0)
 SHIM(wsprintfA, 2, 0, 1)   /* variadic/cdecl: the guest pops */

@@ -664,14 +664,60 @@ int REASM_STDCALL snp_compare_addresses(struct SnpNetAddress *a, struct SnpNetAd
     }
     for (i = 0; i < 16; ++i) if (a->bytes[i] != b->bytes[i]) ++count;
     *differences = count;
-    snp_log("[snp] spiCompareNetAddresses -> TRUE (16-byte compare; Storm return contract UNKNOWN)\n");
-    return 1;
+    /* Semantica: "TRUE = stesso indirizzo". Prima si restituiva sempre TRUE, quindi Storm non
+     * poteva distinguere il proprio peer dagli altri mittenti e i pacchetti SNet di turno
+     * venivano attribuiti al peer sbagliato (sintomo: "Waiting for players" fermo a 0:00). */
+    if (snp_trace_on()) {
+        static int cmp_logged;
+        if (cmp_logged < 12) {
+            ++cmp_logged;
+            snp_log("[snp-trace] compare diff="); reasm_elf_log_hex(count); snp_log("\n");
+        }
+    }
+    return count == 0;
 }
 
-int REASM_STDCALL snp_get_game_info(u32 provider, void *arg2, void *arg3, void *out_info) {
-    (void) provider; (void) arg2; (void) arg3; (void) out_info;
-    snp_log("[snp] spiGetGameInfo -> FALSE (no game info available)\n");
-    return 0;
+static int snp_str_ieq(const char *a, const char *b) {
+    if (!a || !b) return 0;
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a++, cb = (unsigned char)*b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca + 32);
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb + 32);
+        if (ca != cb) return 0;
+    }
+    return *a == 0 && *b == 0;
+}
+
+/* Slot +0x14, 4 argomenti (`ret 0x10`; storm:1503CC83, snp:1D008420):
+ * (game_id, name, arg3, out316). Il provider originale azzera il buffer, seleziona per id e/o
+ * nome (confronto case-insensitive, snp:1D00847D) e copia il record da 0x13C byte nel buffer del
+ * chiamante senza allocare (snp:1D00849D mov ecx,4Fh / rep movsd). arg3 non viene letto. */
+int REASM_STDCALL snp_get_game_info(u32 game_id, const char *name, void *arg3, void *out_info) {
+    struct SnpGameNode *n, *match = 0;
+    (void) arg3;
+    disc_poll();
+    if (!out_info) {
+        snp_log("[snp] spiGetGameInfo -> FALSE (buffer di uscita nullo)\n");
+        return 0;
+    }
+    for (n = g_nodes; n; n = n->next) {
+        int by_name = name && name[0] ? snp_str_ieq(n->name, name) : 0;
+        int by_id = (!name || !name[0]) && game_id ? (n->id == game_id) : 0;
+        if (by_name || by_id) { match = n; break; }
+    }
+    if (!match) {
+        if (snp_trace_on()) {
+            snp_log("[snp-trace] spiGetGameInfo miss id="); reasm_elf_log_hex(game_id);
+            snp_log(" name="); snp_log(name && name[0] ? name : "(vuoto)"); snp_log("\n");
+        }
+        return 0;
+    }
+    memcpy(out_info, match, sizeof *match);
+    if (snp_trace_on()) {
+        snp_log("[snp-trace] spiGetGameInfo hit: "); snp_log(match->name);
+        snp_log(" id="); reasm_elf_log_hex(match->id); snp_log("\n");
+    }
+    return 1;
 }
 
 int REASM_STDCALL snp_get_performance_data(u32 provider, u32 *out, void *file_time, char *extra) {
@@ -868,6 +914,15 @@ static int receive_packet(struct SnpNetAddress **address, char **data, u32 *byte
     packet->bytes = (u32)n;
     for (i = 0; i < (u32)n; ++i) packet->data[i] = payload[i];
     *address = &packet->address; *data = packet->data; *bytes = (u32)n;
+    if (snp_trace_on()) {
+        static int rx_logged;
+        if (rx_logged < 40) {
+            ++rx_logged;
+            snp_log("[snp-trace] recv len="); reasm_elf_log_hex((u32)n);
+            snp_log(" da="); reasm_elf_log_hex(get32((const unsigned char *)&from + 4));
+            snp_log(":"); reasm_elf_log_hex(net_port(from.port)); snp_log("\n");
+        }
+    }
     __atomic_store_n(&g_event_packet_pending, 0, __ATOMIC_RELAXED);
     (void)snp_signal_event();
     return 1;
@@ -892,13 +947,52 @@ int REASM_STDCALL snp_initialize_device(void *a1, void *a2, void *a3, void *a4, 
     return 0;
 }
 
-int REASM_STDCALL snp_unknown_select_game(void *a1, void *a2, void *a3, void *a4, void *a5, void *a6) {
-    (void) a1; (void) a2; (void) a3; (void) a4; (void) a5; (void) a6;
-    /* Slot +0x34: 6 argomenti stdcall, `ret 0x18` (storm:15039044/1503906A, snp:1D009C5D).
-     * La semantica del dialogo e' provata solo in parte: resta fail-closed con arita' corretta,
-     * per non sporcare lo stack del chiamante. Implementazione completa: task LAN-3. */
-    snp_log("[snp] spiSelectGame -> FALSE (6 argomenti, semantica del dialogo non implementata)\n");
+/* Slot +0x34, 6 argomenti (`ret 0x18`; storm:15039044-1503906A). Il provider originale apre un
+ * dialogo proprio (snp:1D009C47 call storm_208) e conferma via storm_118; la semantica dei sei
+ * argomenti non e' ancora provata del tutto. Qui si registra la forma degli argomenti in trace e
+ * si risponde TRUE solo se fra i contesti passati compare il nome di una partita in lista: nessuna
+ * struttura inventata, nessun trasferimento di ownership. */
+static int snp_dword_range_ok(const void *p, u32 bytes) {
+    unsigned long v = (unsigned long)p;
+    return v >= 0x10000ul && v < 0xC0000000ul && (v + bytes) > v;
+}
+static struct SnpGameNode *snp_find_game_in_context(void *ctx, u32 bytes) {
+    struct SnpGameNode *n;
+    const char *s = (const char *)ctx;
+    u32 i;
+    if (!snp_dword_range_ok(ctx, bytes)) return 0;
+    for (n = g_nodes; n; n = n->next) {
+        if (!n->name[0]) continue;
+        for (i = 0; i + 1u < bytes && s[i]; ++i)
+            if (s[i] == n->name[0] && snp_str_ieq(s + i, n->name)) return n;
+    }
     return 0;
+}
+
+int REASM_STDCALL snp_select_game(void *a1, void *a2, void *a3, void *a4, void *a5, void *a6) {
+    struct SnpGameNode *found = 0;
+    disc_poll();
+    if (!found) found = snp_find_game_in_context(a2, 0x60u);
+    if (!found) found = snp_find_game_in_context(a3, 0x10u);
+    if (!found) found = snp_find_game_in_context(a4, 0xBCu);
+    if (!found) found = snp_find_game_in_context(a5, 0x24u);
+    if (snp_trace_on()) {
+        snp_log("[snp-trace] spiSelectGame a1="); reasm_elf_log_hex((u32)(unsigned long)a1);
+        snp_log(" a2="); reasm_elf_log_hex((u32)(unsigned long)a2);
+        snp_log(" a3="); reasm_elf_log_hex((u32)(unsigned long)a3);
+        snp_log(" a4="); reasm_elf_log_hex((u32)(unsigned long)a4);
+        snp_log(" a5="); reasm_elf_log_hex((u32)(unsigned long)a5);
+        snp_log(" a6="); reasm_elf_log_hex((u32)(unsigned long)a6);
+        snp_log(" match="); snp_log(found ? found->name : "nessuno"); snp_log("\n");
+    }
+    if (!found) {
+        snp_log("[snp] spiSelectGame -> FALSE (nessuna partita corrispondente nei contesti)\n");
+        return 0;
+    }
+    snp_log("[snp] spiSelectGame -> TRUE: ");
+    snp_log(found->name);
+    snp_log("\n");
+    return 1;
 }
 int REASM_STDCALL snp_unknown_report_result(void) {
     snp_log("[snp] spiReportGameResult non implementata -> FALSE (ABI/call-site UNKNOWN)\n");
@@ -922,6 +1016,15 @@ int REASM_STDCALL snp_send(u32 count, struct SnpNetAddress **addresses, char *da
         for (j = 0; j < 16; ++j) ((unsigned char *)&to)[j] = src[j];
         if (to.family != SNP_AF_INET || !to.port || !to.address) return 0;
         if (sendto(g_socket_fd, data, bytes, 0, &to, sizeof to) != (int)bytes) return 0;
+        if (snp_trace_on()) {
+            static int tx_logged;
+            if (tx_logged < 40) {
+                ++tx_logged;
+                snp_log("[snp-trace] send len="); reasm_elf_log_hex(bytes);
+                snp_log(" a="); reasm_elf_log_hex(to.address);
+                snp_log(":"); reasm_elf_log_hex(net_port(to.port)); snp_log("\n");
+            }
+        }
         sent_any = 1;
     }
     return sent_any;
@@ -1020,7 +1123,7 @@ static const char *const g_slot_names[] = {
     "snp_lock_game_list",
     "snp_receive",
     "snp_receive_external",
-    "snp_unknown_select_game",
+    "snp_select_game",
     "snp_send",
     "snp_send_external",
     "snp_start_advertising_ladder",
