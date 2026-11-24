@@ -217,26 +217,26 @@ static void storm_loader_init(void) {
     args[0] = IMAGE_BASE_STORM;
     args[1] = 1u;                        /* DLL_PROCESS_ATTACH */
     args[2] = 0u;                        /* lpReserved */
-    out("[arm-game] DllMain di storm (DLL_PROCESS_ATTACH, hinst=0x15000000)\n");
+    out("[game] DllMain di storm (DLL_PROCESS_ATTACH, hinst=0x15000000)\n");
     r = arm_guest_calln(STORM_ENTRY_VA, 3, args, &st);
     if (st != 0) {
-        out("[arm-game] DllMain di storm NON eseguito (status ");
+        out("[game] DllMain di storm NON eseguito (status ");
         if (st < 0) { out("-"); out_dec((unsigned) -st); } else out_dec((unsigned) st);
         out(")\n");
         return;
     }
-    out("[arm-game] DllMain di storm -> ");
+    out("[game] DllMain di storm -> ");
     out_dec((unsigned) r);
     out("\n");
 
     ct = cpu_llasm_read32(STORM_CRYPT_PTR_VA);
     if (ct) {
-        out("[arm-game] tabella crypt di storm non standard a ");
+        out("[game] tabella crypt di storm non standard a ");
         out_hex(ct);
-        out("[arm-game] azzerata: la ricostruisce SFileOpenArchive col seed standard\n");
+        out("[game] azzerata: la ricostruisce SFileOpenArchive col seed standard\n");
         cpu_llasm_write32(STORM_CRYPT_PTR_VA, 0u);
     } else {
-        out("[arm-game] crypt table di storm gia' vuota\n");
+        out("[game] crypt table di storm gia' vuota\n");
     }
 }
 
@@ -253,13 +253,13 @@ int main(void) {
      * cpu_llasm_create, e gli IAT sono risolti staticamente nei bridge. */
     win32_shim_init();
     sc_prof_start();
-    out("[arm-game] runtime ARMv6 — immagini tradotte, import statici\n");
+    out("[game] runtime nativo: immagini tradotte, import statici\n");
 
     /* 1) image regions known to the memory layer */
     for (i = 0; i < GUEST_REGION_COUNT; ++i) {
         if (arm_register_region(k_guest_regions[i].base, k_guest_regions[i].size,
                                 k_guest_regions[i].what) != 0)
-            out("[arm-game] ATTENZIONE: regione non registrata\n");
+            out("[game] ATTENZIONE: regione non registrata\n");
     }
 
     /* 1b) byte dell'immagine PE che il lift non colloca (.rsrc, .reloc, buchi di .text/.rdata).
@@ -271,32 +271,32 @@ int main(void) {
         for (i = 0; i < n; ++i) {
             if (arm_register_region(k_pe_gaps[4 * i], k_pe_gaps[4 * i + 1],
                                     (const char *) (uintptr_t) k_pe_gaps[4 * i + 2]) != 0)
-                out("[arm-game] ATTENZIONE: byte PE non registrati\n");
+                out("[game] ATTENZIONE: byte PE non registrati\n");
         }
-        out("[arm-game] byte PE ai VA originali: ");
+        out("[game] byte PE ai VA originali: ");
         out_dec(n);
         out(" regioni\n");
     } else {
-        out("[arm-game] ATTENZIONE: nessuna regione di byte PE nel link (.rsrc non mappata)\n");
+        out("[game] ATTENZIONE: nessuna regione di byte PE nel link (.rsrc non mappata)\n");
     }
 
     /* 2) PE headers at the image bases */
     if (arm_map_at(IMAGE_BASE_EXE, 0x1000u) == 0) {
         memcpy((void *) (unsigned long) IMAGE_BASE_EXE, k_pe_exe_hdr, k_pe_exe_hdr_len);
         arm_register_region(IMAGE_BASE_EXE, 0x1000u, "exe.pehdr");
-        out("[arm-game] header PE exe a ");
+        out("[game] header PE exe a ");
         out_hex(IMAGE_BASE_EXE);
     }
     if (arm_map_at(IMAGE_BASE_STORM, 0x1000u) == 0) {
         memcpy((void *) (unsigned long) IMAGE_BASE_STORM, k_pe_storm_hdr, k_pe_storm_hdr_len);
         arm_register_region(IMAGE_BASE_STORM, 0x1000u, "storm.pehdr");
-        out("[arm-game] header PE storm a ");
+        out("[game] header PE storm a ");
         out_hex(IMAGE_BASE_STORM);
     }
 
     /* 3) CPU + guest stack + emulated TEB/PEB */
     cpu = cpu_llasm_create(GUEST_STACK_SIZE);
-    if (!cpu) { out("[arm-game] _cpu non creabile (arena bassa)\n"); return 2; }
+    if (!cpu) { out("[game] _cpu non creabile (arena bassa)\n"); return 2; }
     /* Le due regioni di codice del guest (guest_layout_arm.h: exe.code, storm.code) servono
      * all'handler di crash per stampare la catena di chiamate sullo stack emulato. */
     {
@@ -313,15 +313,15 @@ int main(void) {
         cpu_llasm_set_code_ranges(lo[0], hi[0], lo[1], hi[1]);
     }
     if (cpu_llasm_install_crash_handler(cpu) != 0)
-        out("[arm-game] ATTENZIONE: handler di crash non installato\n");
+        out("[game] ATTENZIONE: handler di crash non installato\n");
 
-    out("[arm-game] cpu=");
+    out("[game] cpu=");
     out_hex((uint32_t) (uintptr_t) cpu);
-    out("[arm-game] TEB=");
+    out("[game] TEB=");
     out_hex(arm_teb_base());
-    out("[arm-game] PEB=");
+    out("[game] PEB=");
     out_hex(arm_peb_base());
-    out("[arm-game] bridge: ");
+    out("[game] bridge: ");
     out_dec(g_bridge_count);
     out(" import, ");
     out_dec(arm_bridge_unk_count());
@@ -336,11 +336,11 @@ int main(void) {
             uint32_t end = (uint32_t) (uintptr_t) scratch + 4096u;
             cpu_llasm_write32(0x006DD684u, end);
             cpu_llasm_write32(0x006DD688u, end);
-            out("[arm-game] SC_ATEXIT_FIX: marcatori onexit puntati al buffer dell'arena\n");
+            out("[game] SC_ATEXIT_FIX: marcatori onexit puntati al buffer dell'arena\n");
         }
     }
 
-    out("[arm-game] entry: start() del CRT a 0x00404C21\n");
+    out("[game] entry: start() del CRT a 0x00404C21\n");
 
     /* 3b) limiti del nostro codice per la dispatch dei salti indiretti (indirect_dispatch.c).
      * Senza questo passo un `bx` verso un indirizzo guest non tradotto e' un SIGILL muto. */
@@ -354,11 +354,11 @@ int main(void) {
     if (cpu_llasm_run_raw(cpu, loc_404C21) == 0) {
         /* The sentinel fired: the guest executed its final `ret` (normally the game loops in its
          * own message pump and never comes back). */
-        out("[arm-game] il guest e' tornato al sentinella — stop\n");
-        out("[arm-game] eax=");
+        out("[game] il guest e' tornato al sentinella — stop\n");
+        out("[game] eax=");
         out_hex(cpu->_eax);
     } else {
-        out("[arm-game] l'entry e' tornata senza consumare il sentinella (pila sbilanciata)\n");
+        out("[game] l'entry e' tornata senza consumare il sentinella (pila sbilanciata)\n");
         return 3;
     }
     return 0;

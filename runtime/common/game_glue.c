@@ -25,7 +25,7 @@ const int g_imports_n = 0;
  * this ARM link yet; the explicitly conservative compatibility behavior is success. */
 int build_guard_check(int check_only) {
     (void) check_only;
-    reasm_elf_log("[arm-game-glue] build_guard_check: controllo non configurato, accettato\n");
+    reasm_elf_log("[game-glue] build_guard_check: controllo non configurato, accettato\n");
     return 0;
 }
 
@@ -36,7 +36,7 @@ int build_guard_check(int check_only) {
 void reasm_call_on_stack(void *stack_top, void (*fn)(void)) {
     (void) stack_top;
     if (!fn) {
-        reasm_elf_log("[arm-game-glue] reasm_call_on_stack: callback NULL\n");
+        reasm_elf_log("[game-glue] reasm_call_on_stack: callback NULL\n");
         return;
     }
     fn();
@@ -47,7 +47,7 @@ void reasm_call_on_stack(void *stack_top, void (*fn)(void)) {
  * declares this as void and ignores the result; int preserves the requested 0-success contract. */
 int reasm_iat_install(void) {
     if (g_imports_n == 0) return 0;
-    reasm_elf_log("[arm-game-glue] reasm_iat_install: tabella non vuota inattesa\n");
+    reasm_elf_log("[game-glue] reasm_iat_install: tabella non vuota inattesa\n");
     return 0;
 }
 
@@ -58,7 +58,7 @@ unsigned int reasm_storm_ordinal_va(int ord) {
     uint32_t va = ord > 0 ? arm_bridge_ordinal_va((unsigned) ord) : 0;
     if (!va && !warned_missing) {
         warned_missing = 1;
-        reasm_elf_log("[arm-game-glue] ordinal storm non risolto (ulteriori avvisi soppressi)\n");
+        reasm_elf_log("[game-glue] ordinal storm non risolto (ulteriori avvisi soppressi)\n");
     }
     return (unsigned int) va;
 }
@@ -66,5 +66,5 @@ unsigned int reasm_storm_ordinal_va(int ord) {
 /* The old x86 loader patches native WinMain and transfers control here. The ARM runtime instead
  * enters the translated CRT directly from game_main.c; do not guess a second entry VA here. */
 void winmain_trap(void) {
-    reasm_elf_log("[arm-game-glue] winmain_trap legacy invocato; nessun entry ARM selezionato\n");
+    reasm_elf_log("[game-glue] winmain_trap legacy invocato; nessun entry ARM selezionato\n");
 }
