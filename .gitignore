@@ -35,3 +35,31 @@ tests/x86_affinity_test/test_affinity
 tests/x86_shadow_mem_test/test_shadow
 tests/x86_vm_pool_test/test_vm_pool
 tests/x86_io_readahead_test/test_io_readahead
+
+# --- dati del gioco: mai versionare (serve una copia personale) -------------------------------
+*.snp
+*.SNP
+*.scm
+*.scx
+*.SCM
+*.spc
+*.sng
+*.SNG
+*.smacker
+*.wav
+*.WAV
+StarCraft.exe
+BroodWar.exe
+storm.dll
+battle.snp
+standard.snp
+# --- artefatti della pipeline di lifting (derivati dal binario originale) ---------------------
+*.ll
+# eccezione: IR scritto a mano per i test, non derivato dal gioco
+!tests/x86_fastcc_check/check.ll
+*.bc
+*.entry.o
+/entry/
+guest_layout_*.h
+pe_headers_*.c
+storm_ordinals*.c
