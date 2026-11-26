@@ -93,6 +93,13 @@ def _smaps_rollup(pid):
         return {}
     return out
 
+def _cpu_ticks(pid):
+    try:
+        f = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return int(f[11]) + int(f[12])            # utime + stime
+    except (FileNotFoundError, IndexError, ValueError):
+        return None
+
 def _faults(pid):
     try:
         f = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
@@ -104,7 +111,9 @@ def sample_rss(pid, seconds, out):
     """Una riga al secondo: RSS, HWM, swap, anon/file/shmem, PSS, USS, minor/major faults."""
     end = time.time() + seconds
     keys = {"VmRSS", "VmHWM", "VmSwap", "RssAnon", "RssFile", "RssShmem"}
-    hdr = ("t rss hwm swap anon file shmem pss uss minflt majflt")
+    hdr = ("t rss hwm swap anon file shmem pss uss minflt majflt cpu")
+    hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    prev_cpu = None
     with open(out, "w") as f:
         f.write(hdr + "\n")
         while time.time() < end:
@@ -114,9 +123,14 @@ def sample_rss(pid, seconds, out):
             sm = _smaps_rollup(pid)
             uss = sm.get("Private_Clean", 0) + sm.get("Private_Dirty", 0)
             fl = _faults(pid) or (0, 0)
+            ct = _cpu_ticks(pid)
+            cpu_pct = 0.0
+            if ct is not None and prev_cpu is not None:
+                cpu_pct = 100.0 * (ct - prev_cpu) / max(1, hz)
+            prev_cpu = ct if ct is not None else prev_cpu
             f.write(f"{int(time.time())} {st.get('VmRSS',0)} {st.get('VmHWM',0)} "
                     f"{st.get('VmSwap',0)} {st.get('RssAnon',0)} {st.get('RssFile',0)} "
-                    f"{st.get('RssShmem',0)} {sm.get('Pss',0)} {uss} {fl[0]} {fl[1]}\n")
+                    f"{st.get('RssShmem',0)} {sm.get('Pss',0)} {uss} {fl[0]} {fl[1]} {cpu_pct:.0f}\n")
             f.flush()
             time.sleep(1.0)
 
@@ -211,6 +225,9 @@ def one_run(args, run_idx):
             secs = max(1, len(rows) - 1)
             st["minor_faults_per_s"] = round((rows[-1]["minflt"] - rows[0]["minflt"]) / secs, 1)
             st["major_faults_per_s"] = round((rows[-1]["majflt"] - rows[0]["majflt"]) / secs, 1)
+            if "cpu" in rows[0]:
+                st["cpu_pct_median"] = round(statistics.median([r["cpu"] for r in rows]), 1)
+                st["cpu_pct_peak"] = max(r["cpu"] for r in rows)
     if alloc.exists():
         tot = {"malloc": 0, "free": 0, "mmap": 0, "munmap": 0, "bytes": 0}
         lines = [l for l in alloc.read_text().splitlines() if l.strip()]
@@ -271,7 +288,8 @@ def main():
     for k in ("p50_us", "p95_us", "p99_us", "p999_us", "max_us", "jitter_cv", "p99_over_p50",
               "stutters_2x_p50", "fps_from_p50", "fps_1pct_low", "rss_median_mib", "rss_peak_mib",
               "pss_median_mib", "uss_median_mib", "rss_anon_mib", "rss_file_mib", "swap_peak_mib",
-              "minor_faults_per_s", "major_faults_per_s", "alloc_per_frame"):
+              "minor_faults_per_s", "major_faults_per_s", "alloc_per_frame",
+              "cpu_pct_median", "cpu_pct_peak"):
         vals = [r[k] for r in runs if k in r and r[k] is not None]
         if vals:
             agg[k] = {"median": round(statistics.median(vals), 2),

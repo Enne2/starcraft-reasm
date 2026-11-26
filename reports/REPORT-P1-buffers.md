@@ -50,3 +50,49 @@ relativamente libera (18,8/23,8 GiB usati invece dei 22,2 della baseline) e con 
 Suite `tests/*/check.sh`: **9/9 verde**. Nota: `sc_ctl_test` era rotto dal comando `hash` introdotto
 nella baseline (riferimenti non risolti nell'harness); corretto con riferimenti deboli + risposta
 `err hash unavailable`.
+
+---
+
+## A/B sotto carico CPU (12 run, memoria a parità)
+
+Metodo: `tools/prof/ab-p1.sh`. Due binari costruiti dallo stesso albero — **baseline** dal worktree
+pulito a `b6240dd` (`/tmp/base-pre`) e **P1** da `HEAD` — stesso scenario di gameplay, cap 60,
+`SC_PRESENT=cpu`, 3 run da 40 s per cella, carico generato con 6 processi `yes` (memoria trascurabile,
+nessuna dipendenza esterna) e lasciato girare durante la run. Campionamento di RSS e **CPU% del
+processo** (utime+stime da `/proc/PID/stat`) ogni secondo.
+
+| serie | p50 (ms) | p95 | p99 | jitter CV | RSS picco (MiB) | CPU% |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline / senza carico | 17,04 | 17,94 | 18,61 | 0,590 | 133,5 | 123,0 |
+| **P1 / senza carico** | 17,05 | 18,06 | **18,88** | 0,590 | 139,6 | 123,0 |
+| baseline / **con carico** | 17,83 | 20,74 | 23,93 | 0,571 | 138,1 | 116,0 |
+| **P1 / con carico** | **17,49** | **19,97** | **22,41** | 0,581 | 139,1 | 117,0 |
+
+Differenze P1 vs baseline:
+
+| condizione | Δp50 | Δp95 | Δp99 | ΔCPU | ΔRSS picco |
+|---|---:|---:|---:|---:|---:|
+| senza carico | +0,1% | +0,6% | **+1,4%** | 0,0% | +4,6% |
+| con carico CPU | **−1,9%** | **−3,7%** | **−6,4%** | +0,9% (rumore) | +0,7% |
+
+**Lettura.**
+
+1. **Il beneficio è reale ma solo in contesa.** Senza carico il frame ha margine e togliere 307 KB di
+   `memcpy` per present non si vede (p50 +0,1%, dentro il rumore). Con 6 worker `yes` sulla macchina
+   P1 guadagna **−6,4% sul p99** e −3,7% sul p95: è esattamente dove ci si aspetta che si veda,
+   perché la coda è fatta dalle frame che perdono la contesa.
+2. **Gate ±2% sul p99: rispettato** — +1,4% senza carico (dentro), −6,4% con carico (miglioramento).
+3. **CPU% del processo: nessuna riduzione misurabile** (123% vs 123%; 116% vs 117%). Il `memcpy`
+   rimosso valeva ~18 MB/s a 58 fps, troppo poco per spostare la percentuale. Quindi la frase giusta
+   non è "P1 riduce il carico CPU", ma **"P1 riduce il lavoro per frame e migliora la coda sotto
+   contesa, senza cambiare la CPU media"**.
+4. **RSS: non il −2 MiB atteso, ma +4,6%** (+6 MiB di picco senza carico, +0,7% con carico). I due
+   buffer ora sono allocati in modo stabile e restano residenti, mentre prima erano transitori e
+   potevano essere reclamati. Non è una regressione in valore assoluto (139 MiB su 23 GiB), ma
+   l'atteso risparmio di heap non si è tradotto in RSS: va dichiarato e non rivendicato.
+5. **Jitter CV invariato** (~0,59 in entrambe le condizioni): è dominato dalla struttura del pacing e
+   dai major fault, non dalla copia rimossa.
+
+**Limite**: le due serie (baseline, poi P1) sono state eseguite in sequenza, non interlacciate, e la
+macchina era in pressione di memoria (21,6–22,2 GiB di RAM occupati, ~23 GiB di swap). Le celle "senza
+carico" però concordano entro 0,1% sul p50, il che indica che la deriva fra le due serie è trascurabile.
