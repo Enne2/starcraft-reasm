@@ -72,6 +72,9 @@ extern void SDL_GL_DeleteContext(void *ctx);
 extern void *SDL_GL_GetProcAddress(const char *name);
 extern void SDL_GL_SwapWindow(void *win);
 extern int SDL_GL_SetSwapInterval(int interval);
+extern int clock_gettime(int, void *);
+extern long write(int, const void *, unsigned long);
+extern int open(const char *, int, ...);
 extern int SDL_SetWindowSize(void *win, int w, int h);
 extern int SDL_PollEvent(void *e);
 extern int SDL_PushEvent(const void *e);
@@ -1271,6 +1274,67 @@ static int present_is_duplicate(unsigned int now) {
            bytes_equal((const unsigned char *)g_pal,
                        (const unsigned char *)g_present_palette, sizeof g_pal);
 }
+
+/* ---- SC_FRAME_LOG: per-frame timing for percentile/jitter analysis (measurement only) -------
+ * Each present appends one microsecond delta to a buffer that is flushed in blocks, so the cost
+ * per frame is a clock_gettime + one store (no file I/O in the hot path). The dump is a plain
+ * text file, one delta per line, ready for p50/p95/p99 computation with sort/awk/python.
+ * Deliberately opt-in: without SC_FRAME_LOG=<path> the code is not executed at all. */
+#define SC_FT_CAP 262144u
+#define SC_FT_BLOCK 64u
+static unsigned int g_ft_us[SC_FT_CAP];
+static unsigned int g_ft_n;
+static int g_ft_fd = -1;
+static int g_ft_state;                 /* 0 = not initialised, 1 = enabled, 2 = disabled */
+static long long g_ft_prev_ns;
+
+static long long sc_ft_now_ns(void) {
+    struct { long sec, nsec; } ts;
+    if (clock_gettime(1 /* CLOCK_MONOTONIC */, &ts) != 0) return 0;
+    return (long long)ts.sec * 1000000000LL + ts.nsec;
+}
+
+static void sc_ft_flush_block(void) {
+    unsigned int i = 0;
+    char out[SC_FT_BLOCK * 8];
+    unsigned int n;
+    if (g_ft_fd < 0) return;
+    for (n = 0; n < g_ft_n; ++n) {
+        unsigned int v = g_ft_us[n];
+        char tmp[8];
+        unsigned int t = 0, k;
+        do { tmp[t++] = (char)('0' + (v % 10u)); v /= 10u; } while (v);
+        while (t) out[i++] = tmp[--t];
+        out[i++] = '\n';
+    }
+    if (i) { (void)write(g_ft_fd, out, i); }
+    g_ft_n = 0;
+}
+
+static void sc_ft_frame(void) {
+    long long now;
+    if (g_ft_state == 0) {
+        const char *path = getenv("SC_FRAME_LOG");
+        if (!path || !*path) { g_ft_state = 2; return; }
+        g_ft_fd = open(path, 0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
+        g_ft_state = (g_ft_fd >= 0) ? 1 : 2;
+        if (g_ft_state == 2) return;
+        g_ft_prev_ns = sc_ft_now_ns();
+        return;                        /* the first present only sets the reference time */
+    }
+    if (g_ft_state != 1) return;
+    now = sc_ft_now_ns();
+    if (now > g_ft_prev_ns) {
+        long long d = now - g_ft_prev_ns;
+        if (d > 0xFFFFFFFFLL) d = 0xFFFFFFFFLL;
+        if (g_ft_n < SC_FT_CAP) g_ft_us[g_ft_n++] = (unsigned int)(d / 1000LL);
+        if (g_ft_n >= SC_FT_BLOCK) sc_ft_flush_block();
+    }
+    g_ft_prev_ns = now;
+}
+
+unsigned long host_elf_presented_at_ms(void) { return (unsigned long)g_presented_at; }
+
 static void present_snapshot_commit(unsigned int now) {
     unsigned long size = (unsigned long)g_pitch * (unsigned long)g_h;
     if (!g_present_snapshot && size == g_present_snapshot_size)
@@ -1284,6 +1348,7 @@ static void present_snapshot_commit(unsigned int now) {
     g_pal_dirty = 0;
     g_present_force = 0;
     sc_ctl_frame_presented(g_pal_set);
+    sc_ft_frame();
 }
 
 /* ---- present diretto su framebuffer Linux (/dev/fb0) --------------------------------
@@ -1520,6 +1585,9 @@ static void host_present_frame(int movie) {
         static int sleep_en;
         static int sleep_init;
         if (g_present_nowait) return;          /* niente attesa: il frame lo decide il gioco */
+        /* Confine del frame logico: qui si misura il frame time (SC_FRAME_LOG). Il present, che
+         * puo' avvenire piu' volte per frame, e' misurato a parte da [fps]/SC_PRESENT_DBG. */
+        sc_ft_frame();
         if (!sleep_init) { const char *sv = getenv("SC_FPS_SLEEP"); sleep_en = !(sv && sv[0] == '0'); sleep_init = 1; }
         if (sleep_en) {
             static unsigned int max_sleep;

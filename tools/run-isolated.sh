@@ -131,6 +131,11 @@ cmd_start() {
   [ -n "$script" ] && env_args+=("SC_INPUT_SCRIPT=$script")
   [ -n "$replay" ] && env_args+=("SC_INPUT_REPLAY=$replay")
   [ "$trace" = "1" ] && env_args+=("REASM_TRACE=1")
+  # pass-through delle variabili di misurazione/profilo (inerenti al processo di gioco, non all'host)
+  for v in SC_FRAME_LOG SC_ALLOC_LOG LD_PRELOAD SC_PROF SC_PRESENT SC_GL_VERIFY SC_FPS_CAP \
+           SC_AFFINITY SC_NET_POLL_MS SC_PRESENT_DBG SC_SNP_TRACE SC_NO_GLOBAL_MOUSE; do
+    eval "val=\${$v-}"; [ -n "$val" ] && env_args+=("$v=$val")
+  done
 
   (
     cd "$sdir"

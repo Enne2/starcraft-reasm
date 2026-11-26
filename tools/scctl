@@ -43,6 +43,7 @@ def main():
     q = sub.add_parser("keyup"); q.add_argument("key")
     q = sub.add_parser("text"); q.add_argument("text")
     sub.add_parser("state")
+    sub.add_parser("hash")
     q = sub.add_parser("wait"); q.add_argument("seconds", type=float)
     q = sub.add_parser("seq"); q.add_argument("script")
     a = p.parse_args()
@@ -62,6 +63,7 @@ def main():
         elif a.cmd == "move": text = f"move {a.x} {a.y}"
         elif a.cmd in ("key", "keydown", "keyup"): text = f"{a.cmd} {a.key}"
         elif a.cmd == "text": text = f"text {a.text}"
+        elif a.cmd == "hash": text = "hash"
         else: text = "state"
         command(a.sock, text)
     except (OSError, RuntimeError, UnicodeError) as e:

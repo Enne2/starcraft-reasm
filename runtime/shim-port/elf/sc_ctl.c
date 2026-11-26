@@ -122,6 +122,16 @@ static void handle(int fd,char *line) {
     while(end>line&&(end[-1]=='\r'||end[-1]==' '||end[-1]=='\t')) *--end=0;
     if(!*line)return;
     if(!strcmp(line,"quit")){send_line(fd,"ok quit\n");shutdown(fd,SHUT_RDWR);return;}
+    if(!strcmp(line,"hash")) {
+        extern unsigned char *host_elf_canvas(int *, int *, int *);
+        extern unsigned long host_elf_presented_at_ms(void);
+        int cw=0,ch=0,cp=0; unsigned char *cv=host_elf_canvas(&cw,&ch,&cp);
+        unsigned long h=2166136261ul, i, n = cv ? (unsigned long)cp*(unsigned long)ch : 0;
+        for(i=0;i<n;i+=3u) { h=(h ^ cv[i])*16777619ul; }
+        snprintf(out,sizeof out,"ok hash f=%lu ms=%lu presented=%lu\n",
+                 (h>>8)&0xFFFFFFFFul, host_elf_presented_at_ms(), atomic_load(&presented_count));
+        send_line(fd,out); return;
+    }
     if(!strcmp(line,"state")) { snprintf(out,sizeof out,"ok state frame=%lu w=640 h=480 presented=%lu pal=%d\n",atomic_load(&presented_count),atomic_load(&presented_count),atomic_load(&palette_present));send_line(fd,out);return; }
     if(!strncmp(line,"shot ",5) || !strncmp(line,"rawshot ",8)) {
         int raw = !strncmp(line,"rawshot ",8);
