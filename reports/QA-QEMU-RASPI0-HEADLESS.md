@@ -21,6 +21,53 @@ Conseguenza pratica: **in QEMU puoi verificare il boot, la console, il filesyste
 percorso `SC_PRESENT=fb` (framebuffer legacy)**; **non puoi verificare KMS/DRM, GLES su VideoCore, né
 le prestazioni reali**. Quelli restano prove da fare sul Pi Zero.
 
+## 0b. Immagine: Raspberry Pi OS **Lite** ufficiale (nessun server grafico)
+
+L'ambiente precedente era basato su una immagine derivata che conteneva anche lo stack grafico (il report
+`REPORT-armv6-native-qemu.md` parla di «screenshot del desktop del guest prima di disattivare X»). Per un
+headless pulito si usa ora l'immagine **ufficiale Lite**, che non installa alcun server grafico:
+
+| | valore |
+|---|---|
+| immagine | `2026-10-06-raspios-trixie-armhf-lite.img.xz` → `build/qemu/lite-trixie.img` (2 785 017 856 B) |
+| provenienza | `https://downloads.raspberrypi.com/raspios_lite_armhf/images/raspios_lite_armhf-2026-10-06/` |
+| integrità | `sha256sum -c` **OK** (`2c302771f34c67a0b7ae7aa2e0dcdd3eac660504be59193c011ba79d412e1632`) |
+| kernel/DTB | estratti dalla partizione boot (settore 16384): `kernel.img` (6.18.50+rpt-rpi-v6), `bcm2708-rpi-zero.dtb` |
+| disco di lavoro | overlay `build/qemu/runtime/trixie-lite.qcow2` (8 GiB virtuali, backing `lite-trixie.img`) |
+
+Estrazione di kernel e DTB **senza root**, dalla partizione FAT:
+
+```sh
+BOOT="lite-trixie.img@@$((16384*512))"     # start della partizione 1 da sfdisk -d
+mcopy -o -i "$BOOT" ::/kernel.img           trixie-lite/kernel.img
+mcopy -o -i "$BOOT" ::/bcm2708-rpi-zero.dtb trixie-lite/bcm2708-rpi-zero.dtb
+```
+
+### Prova che non c'è server grafico (due misure indipendenti)
+
+1. **Nel log di boot** (avvio `multi-user.target`): `default target multi-user.target` e
+   **0 occorrenze** di `graphical.target`, `lightdm`, `Xorg`, `wayland`, `sddm`, `gdm`.
+2. **Dentro il guest**, senza credenziali, avviando con `init=/bin/sh` sulla console seriale:
+
+```sh
+# avvio diagnostico (sostituisce il boot normale, non tocca il disco)
+KERNEL_APPEND="rw init=/bin/sh" ... tools/qemu/run.sh
+# poi, sulla console seriale:
+ls /usr/sbin/lightdm /usr/bin/Xorg /usr/bin/startlxde-pi   # tutti: No such file or directory
+grep PRETTY /etc/os-release                                 # Raspbian GNU/Linux 13 (trixie)
+cat /proc/fb                                               # 0 BCM2708 FB
+ls -l /dev/fb0; ls /dev/dri                                 # fb0 presente, /dev/dri assente
+```
+
+Nota: `init=/bin/sh` dà una shell di root sulla seriale **senza login** — comodo per ispezionare
+l'immagine, da usare solo in QA (non è un boot normale: non avvia systemd).
+
+**Il framebuffer resta**: `bcm2708_fb` è il percorso legacy, non un server grafico. In QEMU il DTB viene
+passato direttamente (`bcm2708-rpi-zero.dtb`), quindi l'overlay `dtoverlay=vc4-kms-v3d` presente nel
+`config.txt` dell'immagine **non viene applicato** e `/dev/fb0` compare. È esattamente il caso che serve
+al nostro `SC_PRESENT=fb`; su Pi Zero reale la stessa immagine, con l'overlay attivo, darebbe KMS e
+probabilmente niente `/dev/fb0`.
+
 ## 1. Cosa serve (installato)
 
 - `qemu-system-arm` **10.2.2** (installato con `pkexec dnf install -y qemu-system-arm`; la password si
@@ -38,10 +85,11 @@ le prestazioni reali**. Quelli restano prove da fare sul Pi Zero.
 ```sh
 cd /home/enne2/dev/starcraft-reasm-generic
 QEMU=/usr/bin/qemu-system-arm QEMU_DISPLAY=none \
-IMAGE=$PWD/build/qemu/lite.img \
-DISK=$PWD/build/qemu/runtime/guest-lite.rc.qcow2 \
-KERNEL=$PWD/build/qemu/kernel.img \
-DTB=$PWD/build/qemu/bcm2708-rpi-zero.dtb \
+IMAGE=$PWD/build/qemu/lite-trixie.img \
+DISK=$PWD/build/qemu/runtime/trixie-lite.qcow2 \
+KERNEL=$PWD/build/qemu/trixie-lite/kernel.img \
+DTB=$PWD/build/qemu/trixie-lite/bcm2708-rpi-zero.dtb \
+KERNEL_APPEND="systemd.unit=multi-user.target" \
 setsid nohup bash tools/qemu/run.sh >/tmp/qemu-headless.out 2>&1 < /dev/null &
 ```
 
