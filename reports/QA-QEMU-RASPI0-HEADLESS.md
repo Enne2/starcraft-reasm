@@ -56,6 +56,35 @@ Note:
   `if=sd`. È il motivo per cui l'immagine **non** si avvia "mettendo la SD": serve questa riga di
   comando.
 
+## 2b. Variante grafica (finestra sull'host, host in Wayland)
+
+Stesso ambiente, con `QEMU_DISPLAY=gtk` invece di `none`: la finestra 800×480 viene aperta sul desktop
+dell'host (sessione KDE/Wayland), mentre **seriale e QMP restano su socket** — quindi l'automazione non
+cambia. Serve passare l'ambiente grafico della sessione utente, perché il processo non l'eredita:
+
+```sh
+export XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 \
+       XAUTHORITY=/run/user/1000/xauth_XXXXXX
+QEMU=/usr/bin/qemu-system-arm QEMU_DISPLAY=gtk \
+IMAGE=$PWD/build/qemu/lite.img DISK=$PWD/build/qemu/runtime/guest-lite.rc.qcow2 \
+KERNEL=$PWD/build/qemu/kernel.img DTB=$PWD/build/qemu/bcm2708-rpi-zero.dtb \
+setsid nohup bash tools/qemu/run.sh >/tmp/qemu-gtk.out 2>&1 < /dev/null &
+```
+
+Backend disponibili in questo QEMU: `none gtk sdl egl-headless curses` (`qemu-system-arm -display help`).
+`gtk` funziona anche su Wayland nativo; `sdl` è l'alternativa.
+
+Verificato con `QEMU_DISPLAY=gtk`: processo vivo con `-display gtk`, log seriale con default target
+`multi-user.target` e prompt `raspberrypi login:` raggiunto dopo ~160 s di wall clock (TCG: il tempo del
+guest scorre più lento).
+
+Nota operativa: **fermare la VM per PID**, non con `pkill -f "<pattern>"` quando il pattern compare nella
+propria riga di comando (`pkill` uccide anche la shell che lo esegue — già successo):
+
+```sh
+for p in $(pgrep -x qemu-system-arm); do kill $p; done
+```
+
 ## 3. Verifica del boot (esito reale)
 
 Dentro `build/qemu/runtime/serial.log`:
