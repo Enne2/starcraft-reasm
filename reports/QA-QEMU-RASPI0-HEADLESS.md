@@ -198,6 +198,64 @@ raspberrypi login:
 | audio (PWM/I2S/HDMI) | **no** | PWM non emulato |
 | prestazioni reali del Pi Zero | **no** | TCG non è un modello di prestazioni |
 
+
+## 8. "Resta sui messaggi di boot": diagnosi del prompt di login assente
+
+Sintomo osservato: la VM con finestra GTK sembra ferma sui messaggi del kernel e non arriva al prompt.
+**Non è un problema di console né di getty.** Evidenze raccolte dal log seriale della stessa sessione:
+
+```
+Kernel command line: ... console=tty1 console=ttyAMA0,115200 earlycon=pl011,0x20201000 ...
+[  OK  ] Created slice system-getty.slice
+[  OK  ] Created slice system-serial\x2dget…slice
+[  OK  ] Started getty@tty1.service - Getty on tty1
+[  OK  ] Started serial-getty@ttyAMA0.service - Serial Getty on ttyAMA0
+[  OK  ] Reached target multi-user.target - Multi-User System
+My IP address is 10.0.2.15 fec0::…
+raspberrypi login:
+```
+
+E il login funziona davvero: `pi` / `raspberry` → `pi@raspberrypi`, `uname -m` = `armv6l`.
+
+### Causa reale: primo boot di un'immagine Lite intonsa, sotto emulazione
+
+Il tempo è speso qui, non nella console:
+
+| cosa | misura osservata |
+|---|---|
+| `firstboot` (crea l'utente da `userconf.txt`, ridimensiona la root a 8 G) | una volta sola, al primo avvio |
+| `cloud-init` (4 stadi: local, main, config, final) | `Job cloud-init-main.service/start running (2min 19s / no limit)` |
+| `NetworkManager` | `Job NetworkManager.service/start running (5min 1s / 12min)` |
+| `ldconfig`, `apt-listchanges`, `systemd-update-done` | decine di secondi ciascuno |
+| velocità TCG (penalità strutturale) | tempo guest ≈ 0,3–0,4 × tempo reale |
+
+Risultato misurato: prompt di login a **~500 s di tempo guest, ~11 minuti di orologio da parete** al primo
+avvio. Il log **avanzava** durante l'attesa (misurato: +4,7 KB/min), quindi non era un blocco.
+
+Due trappole che fanno *sembrare* un blocco:
+
+1. systemd aggiorna la stessa riga con `\r` + sequenze ANSI: in un log catturato si vedono righe
+   ripetute `Job … running (2min 6s)`, `(2min 8s)`, … e sembra che nulla progredisca.
+2. subito prima del prompt, `agetty` emette query di terminale (`\x1b[6n`, `\x1b]104`): nel log sono
+   rumore che sembra output corrotto, ma è il prompt che si sta disegnando.
+
+### Correzioni proposte (in ordine di utilità)
+
+1. **Nessuna correzione necessaria** per il prompt: attendere il primo boot. Le misure sopra dicono quanto.
+2. **Accelerare i boot di QA** aggiungendo a `KERNEL_APPEND` il mascheramento dei servizi che servono solo
+   al primo avvio o non servono in laboratorio:
+   `systemd.mask=cloud-init-main.service systemd.mask=cloud-init-local.service systemd.mask=cloud-config.service`
+   (e, se non serve la rete durante il boot, `systemd.mask=NetworkManager-wait-online.service`; **non**
+   mascherare `NetworkManager.service`, altrimenti salta anche l'accesso ssh).
+3. **Saltare del tutto il first boot**: creare l'utente nell'immagine (con `debugfs` sulla partizione
+   root, senza root) e togliere `userconf.txt`, così `firstboot` non ha lavoro da fare.
+4. **Attenzione a `-no-reboot`** (presente in `run.sh`): se un servizio chiede un riavvio, la VM si ferma
+   *silenziosamente* e sembra bloccata. In questa sessione non è successo (nessuna riga di reboot nel
+   log), ma è la prima cosa da escludere se il log smette di crescere del tutto.
+5. **Diagnosi mirata** se il prompt non arriva davvero: `systemd.unit=multi-user.target
+   systemd.log_level=debug`, oppure `init=/bin/sh` (già usato in §0b) per dimostrare che la root è
+   montata; da shell: `systemctl list-jobs`, `cat /proc/cmdline`, `dmesg | tail`.
+
 ## 7. Comandi utili
 
 ```sh
