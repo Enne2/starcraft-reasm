@@ -126,3 +126,58 @@ A ogni run dichiarare scena, OS/kernel, risoluzione/bpp, audio driver, clock/thr
 ## Decisioni autonome
 
 Conservativamente propongo prima il bring-up manuale con audio dummy e framebuffer 32 bpp; audio ALSA e unità al boot solo dopo che menu, input e permessi del framebuffer sono verificati. La build sul Pi non viene dichiarata accettabile: per ora cross-build da frigate, subordinato alla risoluzione dei blocchi documentati della pipeline.
+
+## 7. Diagnosi video: framebuffer, KMS/DRM o HDMI fisico
+
+Questa sezione **precisa e integra** il criterio precedente “se manca `/dev/fb0`, checklist bloccata”: il nodo può mancare perché il connettore KMS non è attivo, perché il sistema non espone fbdev, o per un problema di rilevamento/cablaggio HDMI. Raspberry Pi OS moderno usa normalmente `vc4-kms-v3d`; il framebuffer Linux KMS è una emulazione fbdev legata al display connesso, non il vecchio buffer firmware sempre presente. Desktop e Lite possono quindi differire perché il desktop inizializza/attiva il display, non perché il gioco richieda la GUI.
+
+- [ ] Raccogliere una diagnosi prima di cambiare config o collegamenti:
+  ```sh
+  ls -l /dev/fb0 /dev/dri/card* 2>&1
+  cat /proc/fb
+  fbset -fb /dev/fb0 -i 2>&1
+  cat /sys/class/graphics/fb0/virtual_size 2>&1
+  cat /sys/class/graphics/fb0/bits_per_pixel 2>&1
+  dmesg | grep -i -E 'vc4|fb|hdmi'
+  ls -l /sys/class/drm/
+  for s in /sys/class/drm/card*-HDMI-A-*/status; do [ -e "$s" ] && printf '%s: ' "$s" && cat "$s"; done
+  grep -nE 'vc4-(kms|fkms)-v3d|hdmi_' /boot/firmware/config.txt /boot/config.txt 2>/dev/null
+  cat /proc/cmdline
+  ```
+  `fbset`/sysfs paths possono mancare: è un risultato diagnostico, non un comando da interpretare come “schermo guasto”.
+- [ ] Interpretare i risultati:
+  1. **DRM card presente, HDMI status `connected`, `/dev/fb0` assente**: display rilevato ma nessun fbdev utilizzabile. Controllare `dmesg` e `kmsprint` se installato; in KMS non assumere che `fb0` esista. Per KMS mantenere la modalità e implementare un presenter DRM: dumb buffer (create/map/FB) e modeset con `drmModeSetCrtc` (o page flip). Questo è lavoro aggiuntivo rispetto al presenter attuale, richiede libdrm/KMS master/gestione connettore e modalità, e non è coperto dal codice odierno.
+  2. **HDMI status `disconnected` o nessun connettore/nessuna modalità**: provare monitor acceso, alimentazione, mini-HDMI→HDMI adapter/cavo sicuramente funzionante, inserimento nel connettore corretto e un secondo display/adattatore noto buono. Sul Pi Zero originale il mini-HDMI/adattatore è il primo sospetto pratico quando non compare nemmeno la schermata iniziale; è un’ipotesi diagnostica, non una causa provata. Ripetere `dmesg`, sysfs DRM e boot con display collegato. Se l’adattatore fallisce anche con un altro monitor/cavo, sostituirlo prima di attribuire il difetto a Linux.
+  3. **Connettore `connected`, KMS attivo e nessuna modalità**: come prova di hotplug/mode, aggiungere alla singola riga di `/boot/firmware/cmdline.txt` (non andare a capo) una modalità supportata dal monitor, per esempio `video=HDMI-A-1:1280x720@60D`, poi reboot. Il suffisso `D` forza l’attivazione del display. Usare `1920x1080@60D` solo se display/cavo supportano davvero quel modo. Verificare la nuova riga in `/proc/cmdline`, poi status DRM, `dmesg` e `/dev/fb0`.
+  4. **`/dev/fb0` presente e `fbset` riesce**: testare `SC_PRESENT=fb`; se fallisce, confrontare bpp/stride/mmap e log `[fb]` con il codice sottostante. Una schermata desktop visibile non prova da sola che il dispositivo fbdev sia disponibile al processo.
+- [ ] Scegliere lo stack coerente con l’OS:
+  - **Preferito per OS attuale: KMS + presenter DRM** se il framebuffer KMS non è esposto o se si vuole una modalità HDMI affidabile. Non è `SC_PRESENT=fb` attuale: serve un nuovo backend DRM dumb-buffer.
+  - **KMS + `SC_PRESENT=fb` è accettabile solo se** il KMS espone realmente `/dev/fb0` e il test sotto conferma `FBIOGET_*`, mapping e output corretti. Non è necessario che sia legacy in senso storico: è necessario il fbdev mmap lineare compatibile.
+  - **Legacy/fbdev diretto** può essere usato solo su release/configurazioni che lo supportano. Commentare `dtoverlay=vc4-kms-v3d` o usare `dtoverlay=vc4-fkms-v3d` non è una ricetta garantita sulle release correnti: le opzioni legacy non sono supportate ufficialmente da Raspberry Pi OS Bookworm e successive. Su sistemi legacy/FKMS le impostazioni firmware `hdmi_force_hotplug`, `hdmi_drive`, `hdmi_safe`, `config_hdmi_boost` appartengono a quel percorso; sotto KMS `hdmi_force_hotplug` non forza il connettore. Per KMS la documentazione Raspberry Pi prescrive il parametro kernel `video=HDMI-A-1:<modo>@60D`.
+- [ ] Confermare il contratto del presenter nel sorgente, non per supposizione: `runtime/shim-port/elf/host_elf.c:1367-1373` (`fb_present_requested()` accetta `SC_PRESENT` con prefisso `fb`); `:1403-1425` (`fb_open()` apre `/dev/fb0` o `SC_FB_DEV`, chiama `FBIOGET_FSCREENINFO` e `FBIOGET_VSCREENINFO`, accetta solo 16/32 bpp con risoluzione e `line_length` non zero, quindi fa `mmap(..., MAP_SHARED, ...)`); `:1480-1515` converte palette 8bpp in store 16/32bpp usando `fb_line`/stride per riga. Il codice **non** interroga DRM, non crea dumb buffer e non chiama `drmModeSetCrtc`; si aspetta un fbdev mmap lineare/writable con bpp e stride noti. Nel sorgente il commento `:1359-1364` cita `bcm2708_fb` e QEMU; ciò descrive l’origine/ambiente verificato, ma il contratto tecnico implementato è il framebuffer Linux fbdev, non una verifica che il driver debba necessariamente essere legacy.
+
+## 8. TTY, Ctrl+S/XOFF e automazione input
+
+Ctrl+S inviato a un terminale con `IXON` attivo è il byte ASCII `0x13` (STOP/XOFF), che sospende l’**output del terminale**, non il processo di gioco; Ctrl+Q invia normalmente START/XON (`0x11`) e lo riattiva. Da una sessione SSH/PTY può sembrare che gioco o agente siano bloccati perché smettono di apparire log/output. La modalità terminale non rende Ctrl+S equivalente alla normale lettera `s` per il gioco: non usare la chord Ctrl+S come surrogate della lettera.
+
+- [ ] In ogni shell interattiva usata per launch/QA, disabilitare il flow control:
+  ```sh
+  stty -ixon
+  stty -a | grep -E 'ixon|stop|start'
+  ```
+  In alternativa, disabilitare esplicitamente il carattere STOP con `stty stop undef` (verificare che l’implementazione `stty` lo accetti). `stty -ixon` è la mitigazione preferita.
+- [ ] Persistenza per bash: aggiungere a `~/.bashrc`, solo dopo scelta/configurazione dell’utente:
+  ```sh
+  [[ $- == *i* ]] && stty -ixon
+  ```
+  Il test `[[ ... ]]` limita il comando alle shell interattive. Per la unità systemd, `stty` in `.bashrc` non si applica: se il gioco usa una tty, impostare `stty -ixon` nel profilo/launcher di avvio associato a quella tty prima di `ExecStart` (eventuale wrapper dedicato; non applicarlo a stdin non-tty senza controllo).
+- [ ] Recupero se l’output è fermo: premere **Ctrl+Q**; se la resa del terminale è corrotta, eseguire `reset` oppure `stty sane` dalla stessa tty.
+- [ ] **Regola automazione/QA:** non inviare Ctrl+S come tasto di gioco con `sc_ctl key`, harness, script o sequenze QA. Se il test richiede la lettera S, inviare `s` come tasto/carattere non modificato (eventualmente `keydown s` + `keyup s` secondo il protocollo), oppure un evento text `s` se la scena richiede testo. Un Ctrl+S passato a un PTY con XOFF attivo può bloccare l’output e simulare un gioco “morto”. La tty del Pi deve avere IXON disabilitato nel profilo d’avvio quando il gioco è controllato/avviato da console.
+
+Fonti aggiuntive (comportamento display/terminale):
+- Raspberry Pi OS config e overlay KMS: https://www.raspberrypi.com/documentation/computers/config_txt.html
+- Guida ufficiale migrazione e KMS HDMI/hotplug, `video=HDMI-A-1:1280x720@60D`: https://pip-assets.raspberrypi.com/categories/1259-audio-camera-and-display/documents/RP-004341-WP-2-Troubleshooting%20KMS%20HDMI%20output.pdf
+- Opzioni legacy e loro stato su Bookworm+: https://www.raspberrypi.com/documentation/computers/legacy_config_txt.html
+- DRM KMS e modalità CRTC: https://manpages.debian.org/testing/libdrm-dev/drm-kms.7.en.html
+- Dumb buffers KMS (kernel docs): https://docs.kernel.org/gpu/drm-internals.html
+- POSIX `stty`, `ixon` e `stop undef`: https://pubs.opengroup.org/onlinepubs/9699919799.2018edition/utilities/stty.html

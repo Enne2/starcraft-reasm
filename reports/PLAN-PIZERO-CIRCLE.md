@@ -93,3 +93,29 @@ Stima grossolana di pianificazione (sessione = blocco tecnico; hardware/periferi
 ## Decisioni autonome
 
 Scelta conservativa: prima validare Linux+fb sul Pi Zero reale e trattare Circle come esperimento a gate; non assumere né prestazioni GPU né audio funzionante sulla base di QEMU o delle sole API documentate.
+
+## 7. Vincolo display Linux e alternativa KMS/DRM
+
+La raccomandazione Linux+fb richiede una precisazione: Raspberry Pi OS moderno usa normalmente `dtoverlay=vc4-kms-v3d`; KMS attiva il connettore e il fbdev emulato può apparire solo quando un display è rilevato/attivo. Quindi Lite senza display attivo può non avere `/dev/fb0`, mentre il desktop può inizializzare il connettore e cambiare il risultato. La documentazione Raspberry Pi dice che `hdmi_force_hotplug` è legacy e non implementato da KMS; per forzare il modo KMS si usa nella singola riga di `cmdline.txt` `video=HDMI-A-1:<modo>@60D` (per esempio `video=HDMI-A-1:1280x720@60D`, modo da scegliere in base al monitor). Consultare la checklist §7 per il triage HDMI, incluso il mini-HDMI/adattatore come ipotesi pratica quando non compare neppure lo splash iniziale.
+
+L’implementazione presente di `SC_PRESENT=fb` **non è un presenter DRM**: `runtime/shim-port/elf/host_elf.c:1367-1373` riconosce il prefisso `SC_PRESENT=fb`; `:1403-1425` apre `/dev/fb0` o `SC_FB_DEV`, interroga `FBIOGET_FSCREENINFO`/`FBIOGET_VSCREENINFO`, accetta solo bpp 16/32 e `line_length` non zero, e mappa il framebuffer con `mmap(..., MAP_SHARED, ...)`; `:1480-1515` scrive righe indicizzate usando `fb_line` come stride. Si aspetta dunque **fbdev Linux mappabile/lineare, scrivibile e con stride/bpp noti**. Non verifica che il driver sia per forza firmware legacy: può funzionare anche con fbdev emulato da KMS se il kernel lo espone e il test hardware passa. Il commento storico a `:1359-1364` cita `bcm2708_fb` e QEMU, ma il requisito funzionale è il contratto fbdev.
+
+Scelta operativa:
+
+- Su OS/config legacy che espone un fbdev compatibile, il presenter attuale può essere provato senza desktop. Le opzioni legacy `hdmi_force_hotplug`, `hdmi_drive`, `hdmi_safe` e `config_hdmi_boost` valgono nel legacy/FKMS; **non assumere** che `vc4-fkms-v3d` o rimuovere KMS sia disponibile/supportato su Bookworm e release successive: la documentazione corrente marca le opzioni legacy non supportate da Bookworm in poi.
+- Su KMS corrente, prima verificare `/dev/fb0`, `fbset`, `virtual_size`, `/sys/class/drm/*/status` e `dmesg`. Se il display è connesso ma non c’è fbdev o il formato non è accettato, la strada corretta è aggiungere un backend KMS: aprire il device DRM, selezionare connector/encoder/CRTC e mode, creare e mappare un **DRM dumb buffer**, registrare un framebuffer e presentare con `drmModeSetCrtc` (poi eventualmente page flipping). Questo è sviluppo aggiuntivo sostanziale (libdrm, permessi DRM master, hotplug/mode restore, stride/formato); non è coperto da `SC_PRESENT=fb`.
+- KMS DRM è la scelta raccomandata per mantenere un OS corrente/supportato quando fbdev non è disponibile; legacy fb è una scorciatoia sperimentale subordinata al supporto della release. La GUI non è un requisito architetturale del gioco: il requisito è il backend video effettivamente esposto.
+
+## 8. Terminale/XOFF: rischio operativo e test
+
+In modalità console/PTY, Ctrl+S può arrivare come ASCII `0x13`, XOFF/STOP quando `IXON` è attivo; sospende l’output del terminale, non il processo. Ctrl+Q (XON, `0x11`) riprende l’output. Ciò può simulare uno stallo del gioco o dell’agente in pausa. Le sessioni Linux usate per avviare/monitorare il gioco devono disabilitare IXON (`stty -ixon`), con profilo interattivo `[[ $- == *i* ]] && stty -ixon`; il recupero è Ctrl+Q, poi `reset` o `stty sane` se la tty è corrotta.
+
+Per l’automazione non inviare Ctrl+S come tasto di gioco tramite `sc_ctl key`, harness o QA. Un caso di test che richiede la lettera S invia `s` senza Ctrl (keydown/keyup o text secondo il bisogno). In tty bare-metal Circle, se la console è anche il canale di input/output, la stessa cautela vale per il firmware/driver di console e per la codifica dei controlli; il port non dovrebbe trattare il byte XOFF come shortcut di gioco. Per Linux su tty disabilitare IXON nel profilo di avvio del gioco.
+
+Fonti specifiche:
+- KMS e forza hotplug con kernel `video=`: https://pip-assets.raspberrypi.com/categories/1259-audio-camera-and-display/documents/RP-004341-WP-2-Troubleshooting%20KMS%20HDMI%20output.pdf
+- Overlay KMS/default config: https://www.raspberrypi.com/documentation/computers/config_txt.html
+- Limiti opzioni legacy su Bookworm+: https://www.raspberrypi.com/documentation/computers/legacy_config_txt.html
+- API DRM dumb buffers: https://docs.kernel.org/gpu/drm-internals.html
+- `drmModeSetCrtc`/KMS modesetting: https://manpages.debian.org/testing/libdrm-dev/drm-kms.7.en.html
+- POSIX `IXON`, `stty -ixon`, `stop undef`: https://pubs.opengroup.org/onlinepubs/9699919799.2018edition/utilities/stty.html
