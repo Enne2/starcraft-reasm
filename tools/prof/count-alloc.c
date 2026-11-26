@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <time.h>
+#include <stdio.h>
 
 static void *(*real_malloc)(size_t);
 static void  (*real_free)(void *);
@@ -28,11 +29,61 @@ static int   (*real_munmap)(void *, size_t);
 static unsigned long c_malloc, c_free, c_calloc, c_realloc, c_mmap, c_munmap;
 static unsigned long long bytes_total, live_bytes, peak_live;
 static unsigned long sz_bucket[9];   /* <=64,256,1K,4K,16K,64K,256K,1M,>1M */
+/* attribuzione: chi chiama malloc (return address immediato), tabella con sonde lineari */
+#define CSZ 512
+static struct { void *caller; unsigned long n; unsigned long bytes; } callers[CSZ];
+
+static void caller_add(void *ra, size_t n) {
+    unsigned i = ((unsigned long)ra >> 3) % CSZ, k;
+    for (k = 0; k < 16; ++k, i = (i + 1) % CSZ) {
+        if (callers[i].caller == ra || callers[i].caller == 0) {
+            callers[i].caller = ra;
+            __atomic_add_fetch(&callers[i].n, 1, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&callers[i].bytes, (unsigned long)n, __ATOMIC_RELAXED);
+            return;
+        }
+    }
+}
+
+static void dump_callers(void) {
+    int fd, i, j;
+    const char *path = getenv("SC_ALLOC_CALLERS");
+    char buf[512];
+    int len;
+    if (!path || !*path) return;
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    for (i = 0; i < CSZ; ++i) {
+        if (!callers[i].caller || !callers[i].n) continue;
+        len = 0;
+        {   char t[24]; int k = 0, m; unsigned long v = (unsigned long)callers[i].caller;
+            const char *hx = "0123456789abcdef";
+            do { t[k++] = hx[v & 15u]; v >>= 4; } while (v);
+            buf[len++] = '0'; buf[len++] = 'x';
+            for (m = k - 1; m >= 0; --m) buf[len++] = t[m];
+        }
+        buf[len++] = ' '; buf[len++] = 'n'; buf[len++] = '=';
+        {   unsigned long v = callers[i].n; char t[24]; int k = 0, m;
+            do { t[k++] = (char)('0' + v % 10u); v /= 10u; } while (v);
+            for (m = k - 1; m >= 0; --m) buf[len++] = t[m];
+        }
+        buf[len++] = ' '; buf[len++] = 'b'; buf[len++] = '=';
+        {   unsigned long v = callers[i].bytes; char t[24]; int k = 0, m;
+            do { t[k++] = (char)('0' + v % 10u); v /= 10u; } while (v);
+            for (m = k - 1; m >= 0; --m) buf[len++] = t[m];
+        }
+        buf[len++] = '\n';
+        (void)write(fd, buf, (unsigned long)len);
+    }
+    (void)close(fd);
+}
 static int log_fd = -2;      /* -2 = not initialised, -1 = disabled */
 static unsigned long last_sec;
 
 /* tiny allocation-size map: store the size just before the returned block */
 #define HDR 16u
+
+static void __attribute__((destructor)) fini(void) { dump_callers(); }
 
 static void init(void __attribute__((unused)) *p) {
     real_malloc  = dlsym(RTLD_NEXT, "malloc");
@@ -90,6 +141,7 @@ void *malloc(size_t n) {
     __atomic_add_fetch(&c_malloc, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&bytes_total, (unsigned long long)n, __ATOMIC_RELAXED);
     bucket_add(n);
+    caller_add(__builtin_return_address(0), n);
     p = real_malloc(n);
     if (p) {
         unsigned long long l = __atomic_add_fetch(&live_bytes, (unsigned long long)n, __ATOMIC_RELAXED);
@@ -113,6 +165,7 @@ void *calloc(size_t a, size_t b) {
     __atomic_add_fetch(&c_calloc, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&bytes_total, (unsigned long long)a * b, __ATOMIC_RELAXED);
     bucket_add(a * b);
+    caller_add(__builtin_return_address(0), a * b);
     p = real_calloc(a, b);
     tick();
     return p;
@@ -124,6 +177,7 @@ void *realloc(void *p, size_t n) {
     __atomic_add_fetch(&c_realloc, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&bytes_total, (unsigned long long)n, __ATOMIC_RELAXED);
     bucket_add(n);
+    caller_add(__builtin_return_address(0), n);
     q = real_realloc(p, n);
     tick();
     return q;

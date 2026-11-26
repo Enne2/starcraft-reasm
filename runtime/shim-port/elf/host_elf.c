@@ -420,6 +420,8 @@ static unsigned long g_present_snapshot_size;
 static unsigned int g_presented_at;
 static unsigned int g_present_palette[256];
 static int g_present_snapshot_valid;
+static unsigned long long g_present_canvas_hash;
+static int g_present_hash_valid;
 static int g_pal_set;                /* 0 = nessuna palette impostata (default: scala di grigi) */
 static int g_sc_ctl_initialized;
 static unsigned int g_map[256];      /* palette -> pixel nel formato della finestra */
@@ -551,8 +553,12 @@ static int canvas_alloc(int w, int h) {
         if (g_canvas) { free(g_canvas); g_canvas = 0; }
         g_canvas = (unsigned char *) malloc(size);
     }
-    if (g_present_snapshot) { free(g_present_snapshot); g_present_snapshot = 0; }
-    g_present_snapshot_size = size; g_present_snapshot_valid = 0; g_present_force = 1;
+    if (g_present_snapshot_size != size || !g_present_snapshot) {
+        if (g_present_snapshot) free(g_present_snapshot);
+        g_present_snapshot = (unsigned char *)malloc(size);
+        g_present_snapshot_size = g_present_snapshot ? size : 0;
+    }
+    g_present_snapshot_valid = 0; g_present_hash_valid = 0; g_present_force = 1;
     if (!g_canvas) { g_err = "canvas allocation"; return -1; }
     memset(g_canvas, 0, size);
     g_w = w; g_h = h; g_pitch = pitch;
@@ -633,7 +639,8 @@ void host_elf_shutdown(void) {
     g_map_valid = 0; g_map_fmt = 0;
     gl_ready = 0; g_gl_requested = 0; g_gl_failed = 0; g_gl_explicit = 0;
     if (g_present_snapshot) { free(g_present_snapshot); g_present_snapshot = 0; }
-    g_present_snapshot_valid = 0; g_present_force = 1;
+    g_present_snapshot_size = 0;
+    g_present_snapshot_valid = 0; g_present_hash_valid = 0; g_present_force = 1;
     if (g_inited || g_audio_inited) { SDL_Quit(); g_inited = 0; g_audio_inited = 0; }
 }
 
@@ -1254,25 +1261,22 @@ static unsigned int present_fps_cap(void) {
     }
     return *s ? 0 : (n > 1000u ? 1000u : n);
 }
-static int bytes_equal(const unsigned char *a, const unsigned char *b, unsigned long n) {
-    return memcmp(a, b, n) == 0;
+static unsigned long long present_canvas_hash(void) {
+    unsigned long i, size = (unsigned long)g_pitch * (unsigned long)g_h;
+    unsigned long long h = 14695981039346656037ull;
+    for (i = 0; i < size; ++i) h = (h ^ g_canvas[i]) * 1099511628211ull;
+    return h;
 }
 static int present_is_duplicate(unsigned int now) {
     const char *dedup = getenv("SC_DEDUP_PRESENT");
     unsigned long size = (unsigned long)g_pitch * (unsigned long)g_h;
     if ((dedup && dedup[0] == '0') || getenv("SC_GL_VERIFY") || g_present_force ||
-        g_pal_dirty || !g_present_snapshot_valid || now - g_presented_at >= 250u ||
+        g_pal_dirty || !g_present_hash_valid || now - g_presented_at >= 250u ||
         size != g_present_snapshot_size) return 0;
-    if (!g_present_snapshot) {
-        g_present_snapshot = (unsigned char *)malloc(size);
-        if (!g_present_snapshot) return 0;
-        g_present_snapshot_valid = 0;
-        return 0;
-    }
-    return now - g_presented_at < 16u &&
-           bytes_equal(g_canvas, g_present_snapshot, size) &&
-           bytes_equal((const unsigned char *)g_pal,
-                       (const unsigned char *)g_present_palette, sizeof g_pal);
+    return now - g_presented_at < 16u && g_present_hash_valid &&
+           present_canvas_hash() == g_present_canvas_hash &&
+           memcmp((const unsigned char *)g_pal,
+                  (const unsigned char *)g_present_palette, sizeof g_pal) == 0;
 }
 
 /* ---- SC_FRAME_LOG: per-frame timing for percentile/jitter analysis (measurement only) -------
@@ -1337,13 +1341,13 @@ unsigned long host_elf_presented_at_ms(void) { return (unsigned long)g_presented
 
 static void present_snapshot_commit(unsigned int now) {
     unsigned long size = (unsigned long)g_pitch * (unsigned long)g_h;
-    if (!g_present_snapshot && size == g_present_snapshot_size)
-        g_present_snapshot = (unsigned char *)malloc(size);
-    if (g_present_snapshot && size == g_present_snapshot_size) {
+    int forced = g_present_force;
+    g_present_canvas_hash = present_canvas_hash();
+    g_present_hash_valid = 1;
+    if (forced && g_present_snapshot && size == g_present_snapshot_size)
         memcpy(g_present_snapshot, g_canvas, size);
-        memcpy(g_present_palette, g_pal, sizeof g_pal);
-        g_present_snapshot_valid = 1;
-    }
+    memcpy(g_present_palette, g_pal, sizeof g_pal);
+    g_present_snapshot_valid = 1;
     g_presented_at = now;
     g_pal_dirty = 0;
     g_present_force = 0;

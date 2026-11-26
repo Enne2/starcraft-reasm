@@ -123,8 +123,11 @@ static void handle(int fd,char *line) {
     if(!*line)return;
     if(!strcmp(line,"quit")){send_line(fd,"ok quit\n");shutdown(fd,SHUT_RDWR);return;}
     if(!strcmp(line,"hash")) {
-        extern unsigned char *host_elf_canvas(int *, int *, int *);
-        extern unsigned long host_elf_presented_at_ms(void);
+        /* weak: l'harness di test collega sc_ctl.c senza l'host, quindi le due funzioni possono
+         * mancare; in quel caso il comando risponde "err hash" invece di rompere il link. */
+        extern unsigned char *host_elf_canvas(int *, int *, int *) __attribute__((weak));
+        extern unsigned long host_elf_presented_at_ms(void) __attribute__((weak));
+        if (!host_elf_canvas || !host_elf_presented_at_ms) { send_line(fd,"err hash unavailable\n"); return; }
         int cw=0,ch=0,cp=0; unsigned char *cv=host_elf_canvas(&cw,&ch,&cp);
         unsigned long h=2166136261ul, i, n = cv ? (unsigned long)cp*(unsigned long)ch : 0;
         for(i=0;i<n;i+=3u) { h=(h ^ cv[i])*16777619ul; }
