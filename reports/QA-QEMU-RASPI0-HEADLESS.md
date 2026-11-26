@@ -61,6 +61,7 @@ Note:
 Dentro `build/qemu/runtime/serial.log`:
 
 ```
+[   30.173017] systemd[1]: Queued start job for default target multi-user.target.
 [  OK  ] Reached target multi-user.target - Multi-User System.
 raspberrypi login:
 [    2.690931] bcm2708_fb soc:fb: FB found 1 display(s)
@@ -68,8 +69,12 @@ raspberrypi login:
 [    2.723607] bcm2708_fb soc:fb: Registered framebuffer for display 0, size 800x480
 ```
 
-- **boot console-only riuscito**: si arriva a `multi-user.target` e al prompt di login sulla console
-  seriale, **senza** target grafico; nel log non compare né `graphical.target` né `lightdm`/X11.
+- **boot console-only riuscito**: il *default target* è `multi-user.target`
+  (`systemd[1]: Queued start job for default target multi-user.target`), si arriva a
+  `Reached target multi-user.target - Multi-User System` e al prompt `raspberrypi login:`;
+  nel log non compare né `graphical.target` né `lightdm`/X11.
+  Nota pratica: il log della console seriale contiene sequenze ANSI (colori) fra le parole, quindi le
+  ricerche vanno fatte sul token (`grep -a "multi-user.target"`), non sulla frase intera.
 - **framebuffer presente** anche senza `-display` sull'host: `bcm2708_fb` registra `800x480`, e la console
   passa in modalità grafica a 100×30 caratteri. Prova indipendente: `tools/qemu/qa-shot.py` produce uno
   screendump via QMP (`build/qa/qemu-headless-shot.png`, 26 KB) — il framebuffer è vivo anche se sul
