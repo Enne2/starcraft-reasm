@@ -72,9 +72,10 @@ la metrica utile per ottimizzare la presentazione.
 | allocazioni/s (`malloc+calloc+realloc`) | **3.982** |
 | `free`/s | 3.440 |
 | byte richiesti | **248 MiB/s** (8,2 GiB in 33 s) |
+| allocazioni per frame visibile | **46,2** |
 | distribuzione dimensioni | **76,2% ≤ 64 B**, 9,3% ≤ 256 B, 4,5% ≤ 4 KiB, 2,9% ≤ 256 KiB, 2 allocazioni > 1 MiB |
 
-Lettura: **~68 allocazioni per frame visibile**, tre quarti delle quali sono oggetti minuscoli. È
+Lettura: **~46 allocazioni per frame visibile**, tre quarti delle quali sono oggetti minuscoli. È
 churn classico: costo di allocatore, non di dati.
 
 ### 2.4 Latenza input → frame visibile (25 campioni per scenario)
@@ -88,6 +89,77 @@ churn classico: costo di allocatore, non di dati.
 `nanosleep(50 ms)` fra keydown e keyup (per emulare una pressione), quindi la prima misura dava
 50.2 ms con CV 0.001 — era lo strumento, non il gioco. La misura corretta usa `keydown`/`keyup`
 separati (`tools/prof/latency.py`). Con la pressione reale la latenza è **sotto un terzo di frame**.
+
+
+## 2.5 Carico RAM (aggiunto il 2026-11-26, strumenti installati)
+
+Strumenti installati via `pkexec dnf install` (password chiesta nella finestra polkit di KDE, mai
+passata sulla riga di comando): **`perf`** 7.3.5, **`valgrind`** 3.27.1 + **`valgrind.i686`** (serve
+per i guest 32 bit: senza il pacchetto i686 `massif` risponde "failed to start tool 'massif' for
+platform 'x86-linux'"), **`smem`** 1.5. Inoltre `pkexec sysctl -w kernel.perf_event_paranoid=1`
+(era 2), senza il quale `perf` non vede gli eventi CPU/kernel.
+
+### Campionamento per processo (nuovo in `tools/prof/prof-run.py`)
+
+Ogni secondo: `/proc/PID/status` (VmRSS, VmHWM, VmSwap, RssAnon, RssFile, RssShmem),
+`/proc/PID/smaps_rollup` (Pss, Private_Clean+Dirty = **USS**) e `/proc/PID/stat` (minflt/majflt).
+Definizioni: **RSS** conta anche le pagine condivise; **PSS** le ripartisce fra i processi;
+**USS** sono le pagine private (quello che si libererebbe terminando il processo); **HWM** è il picco
+storico di RSS.
+
+### Risultati (gameplay 25-30 s, 2 run per tag)
+
+| Metrica | mediana | min | max |
+|---|---:|---:|---:|
+| RSS mediana | **97,9 MiB** | 65,2 | 130,5 |
+| RSS picco (HWM) | **135,0 MiB** | 132,9 | 137,0 |
+| PSS mediana | 97,0 MiB | 64,3 | 129,7 |
+| **USS mediana** (pagine private) | **96,5 MiB** | 63,8 | 129,1 |
+| RssAnon (heap + nostre strutture) | **52,3 MiB** | 49,5 | 55,0 |
+| RssFile (archivi MPQ + binari mappati) | 44,3 MiB | 7,9 | 80,7 |
+| RssShmem | ~1 MiB | — | — |
+| **Swap (picco)** | **16,4 MiB** | 0 | 32,7 |
+| Minor faults | **324/s** | 322 | 326 |
+| Major faults | **2/s** | 1,4 | 2,5 |
+| Allocazioni per frame | **46,2** | 46,2 | 46,3 |
+
+Lettura: **PSS ≈ USS ≈ RSS** significa che quasi tutta la memoria del processo è privata (nessun
+grosso oggetto condiviso); i 44-80 MiB di **RssFile** sono le pagine degli archivi MPQ mappati in
+lettura e dei binari; i ~52 MiB di **RssAnon** sono l'heap del guest più i nostri buffer.
+
+### Da cosa è fatto l'heap (valgrind massif, run di 42 s su i686)
+
+Picco heap **9,24 MB** (il resto della RSS è memoria mappata, non heap). Primi consumatori:
+
+| % | Byte | Chi |
+|---:|---:|---|
+| 25,5% | 2,47 MB | `SDL_CreateTexture` / `SDL_CreateSurface` (superfici SDL) |
+| **12,7%** | **1,23 MB** | `present_gpu` (`host_elf.c:1162`): buffer di conversione ARGB 640×480×4 |
+| **12,7%** | **1,23 MB** | seconda allocazione gemella dello stesso percorso di presentazione |
+| 10,0% | 0,97 MB | `ds_CreateSoundBuffer` (buffer DirectSound) |
+
+Quindi **~2,5 MB dei 9,2 MB di heap sono nostri buffer di presentazione** e ~1 MB sono buffer audio:
+sono i due candidati naturali per il riuso (fase P1/P4 del piano), non per il gioco.
+
+### Confronto con il footprint del gioco originale
+
+| Configurazione | RSS del processo di gioco | RSS dell'albero completo |
+|---|---:|---:|
+| **Nativo (questo port)** | **97,9 MiB** mediana, 135 MiB picco | ~135 MiB (nessun processo di supporto) |
+| Originale 1.16.1 sotto **Wine** (misura 2026-11-21) | 164,5 MiB (picco 206,5 in boot) | **339-437 MiB** (explorer, winedevice ×2, services, wineserver) |
+
+Ordine di grandezza: il port sta **sotto** l'originale sotto Wine di **~60-70 MiB sul processo** e di
+**~250-300 MiB sull'albero complessivo**, e in assoluto occupa un intervallo di **~100-140 MiB**, di
+cui **~50 MiB anonimi** e **~50-80 MiB di file mappati**.
+
+### Avvertenza: misure prese sotto pressione di memoria
+
+Al momento delle misure la macchina era in forte pressione: **22,2 GiB di 23,8 GiB di RAM occupati**,
+**25,5 GiB di swap in uso** (swapfile 13,3 GiB + zram 11,6 GiB quasi pieni), `vm.swappiness=60`.
+Conseguenze misurate: parte del processo finisce in swap (fino a 32,7 MiB), i major fault crescono
+(~2/s) e i percentili peggiorano (p99 da 18,4 ms a ~21 ms nella stessa scena). **I gate vanno quindi
+applicati a parità di condizioni**: prima di dichiarare una regressione o un miglioramento, la
+macchina deve essere in salute (o si misura tutto nella stessa finestra temporale).
 
 ## 3. Profilo CPU (hotspot)
 
@@ -103,11 +175,12 @@ separati (`tools/prof/latency.py`). Con la pressione reale la latenza è **sotto
 | 0,9% | `reasm_indirect_*` | risoluzione dei salti indiretti |
 | resto | frammentato | — |
 
-Limite dichiarato: su questa macchina **non sono installati `perf`, `valgrind` né `sysprof-cli`** e
-`perf_event_paranoid=2`; quindi niente `perf stat` (IPC, cache/branch miss) né flamegraph completo.
-Il campionatore interno copre il codice guest e i simboli del nostro binario, non le librerie di
-sistema (per quelle servirebbe un run con `/proc/pid/maps` catturato alla stessa apertura, oppure
-installare `perf`).
+Nota sugli strumenti: `perf`, `valgrind` (+ pacchetto i686) e `smem` sono ora installati e
+`perf_event_paranoid=1`. `perf stat` funziona su processi brevi, ma **avvolgere il gioco non ha
+prodotto contatori** (il processo non termina in modo pulito sotto `perf` nelle prove fatte): IPC,
+cache miss e branch miss restano quindi **non misurati**. `valgrind massif` invece funziona sui guest
+i386 e ha prodotto la ripartizione dell'heap di §2.5. Il campionatore interno copre il codice guest e
+i simboli del nostro binario, non le librerie di sistema.
 
 ## 4. Colli di bottiglia, in ordine di guadagno atteso
 

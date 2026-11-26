@@ -70,19 +70,54 @@ def stats_from_frames(path, warmup_s):
     }
 
 
+def _kv_status(pid, keys):
+    out = {}
+    try:
+        for line in pathlib.Path(f"/proc/{pid}/status").read_text().splitlines():
+            k = line.split(":", 1)[0]
+            if k in keys:
+                out[k] = int(line.split()[1])          # kB
+    except (FileNotFoundError, IndexError, ValueError):
+        return {}
+    return out
+
+def _smaps_rollup(pid):
+    out = {}
+    try:
+        for line in pathlib.Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].endswith(":"):
+                try: out[parts[0].rstrip(":")] = int(parts[1])
+                except ValueError: pass
+    except (FileNotFoundError, IndexError, ValueError):
+        return {}
+    return out
+
+def _faults(pid):
+    try:
+        f = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return int(f[7]), int(f[9])                    # minflt, majflt (dopo il campo 4)
+    except (FileNotFoundError, IndexError, ValueError):
+        return None
+
 def sample_rss(pid, seconds, out):
+    """Una riga al secondo: RSS, HWM, swap, anon/file/shmem, PSS, USS, minor/major faults."""
     end = time.time() + seconds
+    keys = {"VmRSS", "VmHWM", "VmSwap", "RssAnon", "RssFile", "RssShmem"}
+    hdr = ("t rss hwm swap anon file shmem pss uss minflt majflt")
     with open(out, "w") as f:
+        f.write(hdr + "\n")
         while time.time() < end:
-            try:
-                txt = pathlib.Path(f"/proc/{pid}/status").read_text()
-                rss = [l.split()[1] for l in txt.splitlines() if l.startswith("VmRSS:")]
-                hwm = [l.split()[1] for l in txt.splitlines() if l.startswith("VmHWM:")]
-                if rss:
-                    f.write(f"{int(time.time())} {rss[0]} {hwm[0] if hwm else 0}\n")
-                    f.flush()
-            except FileNotFoundError:
+            st = _kv_status(pid, keys)
+            if not st:
                 return
+            sm = _smaps_rollup(pid)
+            uss = sm.get("Private_Clean", 0) + sm.get("Private_Dirty", 0)
+            fl = _faults(pid) or (0, 0)
+            f.write(f"{int(time.time())} {st.get('VmRSS',0)} {st.get('VmHWM',0)} "
+                    f"{st.get('VmSwap',0)} {st.get('RssAnon',0)} {st.get('RssFile',0)} "
+                    f"{st.get('RssShmem',0)} {sm.get('Pss',0)} {uss} {fl[0]} {fl[1]}\n")
+            f.flush()
             time.sleep(1.0)
 
 
@@ -158,20 +193,34 @@ def one_run(args, run_idx):
     if not st:
         return None
     if rss.exists():
-        rows = [l.split() for l in rss.read_text().splitlines() if l.strip()]
-        if rows:
-            st["rss_median_mib"] = round(statistics.median([int(r[1]) for r in rows]) / 1024, 1)
-            st["rss_peak_mib"] = round(max(int(r[2]) for r in rows) / 1024, 1)
+        lines = [l for l in rss.read_text().splitlines() if l.strip()]
+        if len(lines) > 2:
+            hdr = lines[0].split()
+            rows = [dict(zip(hdr, r.split())) for r in lines[1:]]
+            rows = [{k: int(v) for k, v in r.items()} for r in rows]
+            mib = lambda k, agg="median": round(
+                (statistics.median([r[k] for r in rows]) if agg == "median" else max(r[k] for r in rows)) / 1024, 1)
+            st["rss_median_mib"] = mib("rss")
+            st["rss_peak_mib"] = mib("hwm", "max")
+            st["pss_median_mib"] = mib("pss")
+            st["uss_median_mib"] = mib("uss")
+            st["rss_anon_mib"] = mib("anon")
+            st["rss_file_mib"] = mib("file")
+            st["rss_shmem_mib"] = mib("shmem")
+            st["swap_peak_mib"] = mib("swap", "max")
+            secs = max(1, len(rows) - 1)
+            st["minor_faults_per_s"] = round((rows[-1]["minflt"] - rows[0]["minflt"]) / secs, 1)
+            st["major_faults_per_s"] = round((rows[-1]["majflt"] - rows[0]["majflt"]) / secs, 1)
     if alloc.exists():
         tot = {"malloc": 0, "free": 0, "mmap": 0, "munmap": 0, "bytes": 0}
         lines = [l for l in alloc.read_text().splitlines() if l.strip()]
-        prev = None
+        # count-alloc azzera i contatori a ogni riga: i valori stampati SONO già delta per secondo,
+        # quindi si sommano (sottrarli come cumulativi dava totali negativi).
         for l in lines:
             d = dict(kv.split("=", 1) for kv in l.split()[1:])
-            if prev:
-                for k in ("malloc", "free", "mmap", "munmap", "bytes"):
-                    tot[k] += int(d.get(k, 0)) - prev.get(k, 0)
-            prev = {k: int(v) for k, v in d.items()}
+            for k in ("malloc", "free", "mmap", "munmap", "bytes"):
+                if k in d and d[k].isdigit():
+                    tot[k] += int(d[k])
         secs = max(1, len(lines) - 1)
         st["alloc_per_s"] = {k: round(v / secs, 1) for k, v in tot.items()}
         st["alloc_per_frame"] = round(tot["malloc"] / max(1, st["frames"]), 2)
@@ -220,7 +269,9 @@ def main():
         return 1
     agg = {}
     for k in ("p50_us", "p95_us", "p99_us", "p999_us", "max_us", "jitter_cv", "p99_over_p50",
-              "stutters_2x_p50", "fps_from_p50", "fps_1pct_low", "rss_median_mib", "rss_peak_mib"):
+              "stutters_2x_p50", "fps_from_p50", "fps_1pct_low", "rss_median_mib", "rss_peak_mib",
+              "pss_median_mib", "uss_median_mib", "rss_anon_mib", "rss_file_mib", "swap_peak_mib",
+              "minor_faults_per_s", "major_faults_per_s", "alloc_per_frame"):
         vals = [r[k] for r in runs if k in r and r[k] is not None]
         if vals:
             agg[k] = {"median": round(statistics.median(vals), 2),
